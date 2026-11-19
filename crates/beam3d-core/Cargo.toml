@@ -1,0 +1,12 @@
+[package]
+name = "beam3d-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nalgebra.workspace = true
+faer.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/beam3d-core",
+    "crates/beam3d-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+nalgebra = { version = "0.35", features = ["serde-serialize"] }
+faer = { version = "0.24", default-features = false, features = ["std", "sparse-linalg"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+bytemuck = { version = "1.21", features = ["derive"] }
+eframe = { version = "0.37", default-features = true }
+egui_extras = "0.37"
+egui_plot = "0.38"
+rfd = "0.18"

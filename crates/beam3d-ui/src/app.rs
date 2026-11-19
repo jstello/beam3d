@@ -1,0 +1,974 @@
+use crate::camera::{OrbitCamera, point_to_segment_dist_2d};
+use crate::mesh_gen::{
+    ColorField, DiagramRibbon, LegendRange, ViewportDisplayOptions, build_scene_geometry,
+    colormap_diverging, colormap_scientific,
+};
+use crate::panels::{draw_bottom_panel, draw_left_panel, draw_right_panel};
+use crate::renderer::{CameraUniform, SceneGeometry, ViewportRenderer};
+use beam3d_core::{Solution, StructuralModel, TemplateKind, solve_linear_static};
+use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, RichText, Stroke};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorTool {
+    Select,
+    AddNode,
+    DrawBeam,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftTab {
+    Structure,
+    Sections,
+    Loads,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BottomTab {
+    MemberDiagrams,
+    ReactionsTable,
+    DisplacementsTable,
+}
+
+pub struct Beam3dApp {
+    pub model: StructuralModel,
+    undo_stack: Vec<StructuralModel>,
+    redo_stack: Vec<StructuralModel>,
+
+    pub solution: Option<Solution>,
+    pub solver_error: Option<String>,
+    pub auto_solve: bool,
+    dirty_solve: bool,
+
+    pub selected_node: Option<usize>,
+    pub selected_element: Option<usize>,
+    pub hovered_node: Option<usize>,
+    pub hovered_element: Option<usize>,
+
+    pub selected_section_idx: usize,
+    pub selected_material_idx: usize,
+    pub new_node_pos: [f64; 3],
+    pub new_beam_ni: usize,
+    pub new_beam_nj: usize,
+    pub subdivide_count: usize,
+
+    pub tool: EditorTool,
+    pub beam_draw_start: Option<usize>,
+    pub workplane_z: f64,
+    pub snap_grid: f64,
+
+    pub left_tab: LeftTab,
+    pub bottom_tab: BottomTab,
+    pub show_bottom_panel: bool,
+
+    pub show_grid: bool,
+    pub show_extruded: bool,
+    pub profile_scale: f32,
+    pub show_deformed: bool,
+    pub animate_deformed: bool,
+    anim_time: f64,
+    pub show_undeformed_ghost: bool,
+    pub disp_scale: f64,
+    pub show_supports: bool,
+    pub show_loads: bool,
+    pub show_reactions: bool,
+    pub show_local_axes: bool,
+    pub show_node_labels: bool,
+    pub color_field: ColorField,
+    pub diagram_ribbon: DiagramRibbon,
+    pub diagram_scale: f32,
+
+    pub camera: OrbitCamera,
+    renderer: Option<ViewportRenderer>,
+    scene_geo: SceneGeometry,
+    pub status_msg: String,
+}
+
+impl Beam3dApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        configure_engineering_theme(&cc.egui_ctx);
+
+        let renderer = cc
+            .wgpu_render_state
+            .as_ref()
+            .map(ViewportRenderer::new);
+
+        let model = TemplateKind::MultiStoryBuilding.build();
+        let mut camera = OrbitCamera::default();
+        let (min_p, max_p) = model.bounding_box();
+        camera.fit_to_bounds(min_p, max_p);
+
+        let mut app = Self {
+            model,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            solution: None,
+            solver_error: None,
+            auto_solve: true,
+            dirty_solve: true,
+            selected_node: None,
+            selected_element: Some(1),
+            hovered_node: None,
+            hovered_element: None,
+            selected_section_idx: 0,
+            selected_material_idx: 0,
+            new_node_pos: [0.0, 0.0, 0.0],
+            new_beam_ni: 1,
+            new_beam_nj: 2,
+            subdivide_count: 4,
+            tool: EditorTool::Select,
+            beam_draw_start: None,
+            workplane_z: 0.0,
+            snap_grid: 0.5,
+            left_tab: LeftTab::Structure,
+            bottom_tab: BottomTab::MemberDiagrams,
+            show_bottom_panel: true,
+            show_grid: true,
+            show_extruded: true,
+            profile_scale: 1.0,
+            show_deformed: true,
+            animate_deformed: false,
+            anim_time: 0.0,
+            show_undeformed_ghost: true,
+            disp_scale: 50.0,
+            show_supports: true,
+            show_loads: true,
+            show_reactions: false,
+            show_local_axes: false,
+            show_node_labels: false,
+            color_field: ColorField::VonMisesStress,
+            diagram_ribbon: DiagramRibbon::None,
+            diagram_scale: 1.0,
+            camera,
+            renderer,
+            scene_geo: SceneGeometry::default(),
+            status_msg: "Loaded 3D Braced Multi-Story Steel Frame.".to_string(),
+        };
+        app.run_solver();
+        app.recompute_auto_disp_scale();
+        app
+    }
+
+    pub fn push_undo(&mut self) {
+        if self.undo_stack.len() >= 40 {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(self.model.clone());
+        self.redo_stack.clear();
+    }
+
+    pub fn undo(&mut self) {
+        if let Some(prev) = self.undo_stack.pop() {
+            self.redo_stack.push(self.model.clone());
+            self.model = prev;
+            self.mark_model_changed();
+            self.status_msg = "Undid last edit.".to_string();
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(self.model.clone());
+            self.model = next;
+            self.mark_model_changed();
+            self.status_msg = "Redid edit.".to_string();
+        }
+    }
+
+    pub fn mark_model_changed(&mut self) {
+        self.dirty_solve = true;
+    }
+
+    pub fn load_model(&mut self, new_model: StructuralModel, status: impl Into<String>) {
+        self.push_undo();
+        self.model = new_model;
+        self.selected_node = None;
+        self.selected_element = self.model.elements.first().map(|e| e.id);
+        self.selected_section_idx = 0;
+        self.selected_material_idx = 0;
+        self.beam_draw_start = None;
+        let (min_p, max_p) = self.model.bounding_box();
+        self.camera.set_preset_iso();
+        self.camera.fit_to_bounds(min_p, max_p);
+        self.run_solver();
+        self.recompute_auto_disp_scale();
+        self.status_msg = status.into();
+    }
+
+    pub fn run_solver(&mut self) {
+        self.dirty_solve = false;
+        match solve_linear_static(&self.model) {
+            Ok(sol) => {
+                self.status_msg = format!(
+                    "Solved {} DOFs in {:.2} ms — Max |u| = {:.3} mm, Max σ = {:.1} MPa",
+                    sol.summary.free_dofs,
+                    sol.summary.solve_time_ms,
+                    sol.summary.max_displacement_m * 1e3,
+                    sol.summary.max_stress_pa * 1e-6
+                );
+                self.solution = Some(sol);
+                self.solver_error = None;
+            }
+            Err(e) => {
+                self.solution = None;
+                self.solver_error = Some(e.to_string());
+                self.status_msg = format!("Solver warning: {e}");
+            }
+        }
+    }
+
+    pub fn recompute_auto_disp_scale(&mut self) {
+        if let Some(sol) = &self.solution {
+            let max_u = sol.summary.max_displacement_m;
+            if max_u > 1e-9 {
+                let target_visual = 0.075 * self.model.characteristic_length();
+                self.disp_scale = (target_visual / max_u).clamp(0.5, 2000.0);
+            }
+        }
+    }
+
+    fn save_json_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Beam3D JSON Model", &["json"])
+            .set_file_name(format!(
+                "{}.json",
+                self.model.name.to_lowercase().replace(' ', "_")
+            ))
+            .save_file()
+        {
+            match self.model.to_json_pretty() {
+                Ok(txt) => match std::fs::write(&path, txt) {
+                    Ok(()) => self.status_msg = format!("Saved model to {}", path.display()),
+                    Err(e) => self.status_msg = format!("Failed to write file: {e}"),
+                },
+                Err(e) => self.status_msg = format!("Serialization error: {e}"),
+            }
+        }
+    }
+
+    fn open_json_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Beam3D JSON Model", &["json"])
+            .pick_file()
+        {
+            match std::fs::read_to_string(&path) {
+                Ok(txt) => match StructuralModel::from_json(&txt) {
+                    Ok(m) => self.load_model(m, format!("Loaded {}", path.display())),
+                    Err(e) => self.status_msg = format!("Invalid JSON model: {e}"),
+                },
+                Err(e) => self.status_msg = format!("Failed to read file: {e}"),
+            }
+        }
+    }
+}
+
+impl eframe::App for Beam3dApp {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        handle_global_shortcuts(self, &ctx);
+
+        if self.dirty_solve && self.auto_solve {
+            self.run_solver();
+        }
+
+        if self.animate_deformed && self.show_deformed {
+            let dt = ctx.input(|i| i.stable_dt) as f64;
+            self.anim_time += dt * 2.8;
+            ctx.request_repaint();
+        }
+
+        // 1. Top Command Toolbar
+        egui::Panel::top("top_toolbar")
+            .exact_size(40.0)
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.label(
+                        RichText::new("◆ Beam3D")
+                            .strong()
+                            .size(15.5)
+                            .color(Color32::from_rgb(105, 185, 255)),
+                    );
+                    ui.separator();
+
+                    egui::ComboBox::from_id_salt("templates_menu")
+                        .selected_text("📂 Templates...")
+                        .width(145.0)
+                        .show_ui(ui, |ui| {
+                            for kind in TemplateKind::ALL {
+                                if ui.selectable_label(false, kind.title()).clicked() {
+                                    self.load_model(
+                                        kind.build(),
+                                        format!("Loaded template: {}", kind.title()),
+                                    );
+                                }
+                            }
+                            ui.separator();
+                            if ui
+                                .selectable_label(false, "✨ New Empty Model")
+                                .clicked()
+                            {
+                                self.load_model(
+                                    StructuralModel::default(),
+                                    "Created new empty workspace.",
+                                );
+                            }
+                        });
+
+                    if ui.button("Open...").clicked() {
+                        self.open_json_dialog();
+                    }
+                    if ui.button("Save...").clicked() {
+                        self.save_json_dialog();
+                    }
+
+                    ui.separator();
+                    if ui
+                        .add_enabled(!self.undo_stack.is_empty(), egui::Button::new("↶ Undo"))
+                        .clicked()
+                    {
+                        self.undo();
+                    }
+                    if ui
+                        .add_enabled(!self.redo_stack.is_empty(), egui::Button::new("↷ Redo"))
+                        .clicked()
+                    {
+                        self.redo();
+                    }
+
+                    ui.separator();
+                    ui.label(RichText::new("Tool:").small().color(Color32::from_gray(170)));
+                    if ui
+                        .selectable_label(self.tool == EditorTool::Select, "🖱 Select")
+                        .clicked()
+                    {
+                        self.tool = EditorTool::Select;
+                        self.beam_draw_start = None;
+                    }
+                    if ui
+                        .selectable_label(self.tool == EditorTool::AddNode, "⊕ Add Node")
+                        .clicked()
+                    {
+                        self.tool = EditorTool::AddNode;
+                        self.beam_draw_start = None;
+                    }
+                    if ui
+                        .selectable_label(self.tool == EditorTool::DrawBeam, "📏 Draw Beam")
+                        .clicked()
+                    {
+                        self.tool = EditorTool::DrawBeam;
+                    }
+
+                    if self.tool != EditorTool::Select {
+                        ui.label(RichText::new("Z:").small());
+                        ui.add(
+                            egui::DragValue::new(&mut self.workplane_z)
+                                .speed(0.25)
+                                .suffix("m"),
+                        );
+                        ui.label(RichText::new("Snap:").small());
+                        ui.add(
+                            egui::DragValue::new(&mut self.snap_grid)
+                                .speed(0.05)
+                                .range(0.0..=5.0)
+                                .suffix("m"),
+                        );
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.toggle_value(&mut self.show_bottom_panel, "📊 Charts & Tables");
+                        ui.checkbox(&mut self.auto_solve, "Auto-Solve");
+                        let solve_btn = egui::Button::new(
+                            RichText::new("▶ Solve FEA")
+                                .strong()
+                                .color(Color32::from_rgb(15, 30, 20)),
+                        )
+                        .fill(Color32::from_rgb(80, 215, 135));
+                        if ui.add(solve_btn).clicked() {
+                            self.run_solver();
+                        }
+                    });
+                });
+            });
+
+        // 2. Bottom Status Bar
+        egui::Panel::bottom("status_bar")
+            .exact_size(24.0)
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.label(
+                        RichText::new(&self.status_msg)
+                            .small()
+                            .color(Color32::from_gray(195)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(
+                                "Orbit: Drag / Right-Drag  |  Pan: Middle / Shift+Drag  |  Zoom: Scroll  |  Fit: [F]",
+                            )
+                            .small()
+                            .color(Color32::from_gray(140)),
+                        );
+                    });
+                });
+            });
+
+        // 3. Left Model Builder Panel
+        egui::Panel::left("left_model_panel")
+            .default_size(300.0)
+            .size_range(260.0..=420.0)
+            .show(ui, |ui| {
+                draw_left_panel(self, ui);
+            });
+
+        // 4. Right Inspector & Post-Processing Panel
+        egui::Panel::right("right_inspector_panel")
+            .default_size(305.0)
+            .size_range(265.0..=420.0)
+            .show(ui, |ui| {
+                draw_right_panel(self, ui);
+            });
+
+        // 5. Optional Bottom 2D Member Diagrams & Reaction Tables Panel
+        if self.show_bottom_panel {
+            egui::Panel::bottom("bottom_results_panel")
+                .default_size(205.0)
+                .size_range(145.0..=360.0)
+                .resizable(true)
+                .show(ui, |ui| {
+                    draw_bottom_panel(self, ui);
+                });
+        }
+
+        // 6. Central 3D Hardware-Accelerated Viewport
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(Color32::from_rgb(19, 22, 29)))
+            .show(ui, |ui| {
+                draw_central_3d_viewport(self, ui, frame);
+            });
+    }
+}
+
+fn handle_global_shortcuts(app: &mut Beam3dApp, ctx: &egui::Context) {
+    if ctx.egui_wants_keyboard_input() {
+        return;
+    }
+    ctx.input(|i| {
+        if i.key_pressed(egui::Key::F) {
+            let (min_p, max_p) = app.model.bounding_box();
+            app.camera.fit_to_bounds(min_p, max_p);
+        }
+        if i.key_pressed(egui::Key::Escape) {
+            if app.beam_draw_start.is_some() {
+                app.beam_draw_start = None;
+            } else {
+                app.tool = EditorTool::Select;
+                app.selected_node = None;
+                app.selected_element = None;
+            }
+        }
+        if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
+            if let Some(nid) = app.selected_node.take() {
+                app.push_undo();
+                app.model.remove_node(nid);
+                app.mark_model_changed();
+            } else if let Some(eid) = app.selected_element.take() {
+                app.push_undo();
+                app.model.remove_element(eid);
+                app.mark_model_changed();
+            }
+        }
+        if i.modifiers.command && i.key_pressed(egui::Key::Z) {
+            if i.modifiers.shift {
+                app.redo();
+            } else {
+                app.undo();
+            }
+        }
+    });
+}
+
+fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    let rect = ui.available_rect_before_wrap();
+    let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+
+    // Camera navigation
+    if response.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll.abs() > 0.01 {
+            app.camera.zoom(scroll);
+        }
+    }
+
+    let shift_held = ui.input(|i| i.modifiers.shift);
+    if response.dragged_by(egui::PointerButton::Middle)
+        || (shift_held
+            && (response.dragged_by(egui::PointerButton::Primary)
+                || response.dragged_by(egui::PointerButton::Secondary)))
+    {
+        app.camera.pan(response.drag_delta(), rect.height());
+    } else if response.dragged_by(egui::PointerButton::Secondary)
+        || (app.tool == EditorTool::Select && response.dragged_by(egui::PointerButton::Primary))
+    {
+        app.camera.orbit(response.drag_delta());
+    }
+
+    // 3D Hover picking & workplane cursor snapping
+    app.hovered_node = None;
+    app.hovered_element = None;
+    let mut preview_point: Option<[f64; 3]> = None;
+
+    if let Some(cursor) = response.hover_pos() {
+        // 1. Closest node in screen pixels
+        let mut best_node_dist = 14.0_f32;
+        for n in &app.model.nodes {
+            if let Some((sp, _)) = app.camera.project_to_screen(n.position, rect) {
+                let d = (sp - cursor).length();
+                if d < best_node_dist {
+                    best_node_dist = d;
+                    app.hovered_node = Some(n.id);
+                }
+            }
+        }
+
+        // 2. Closest beam segment if not directly hovering a node
+        if app.hovered_node.is_none() {
+            let mut best_elem_dist = 9.5_f32;
+            for el in &app.model.elements {
+                if let (Some(ni), Some(nj)) =
+                    (app.model.get_node(el.node_i), app.model.get_node(el.node_j))
+                {
+                    if let (Some((sa, _)), Some((sb, _))) = (
+                        app.camera.project_to_screen(ni.position, rect),
+                        app.camera.project_to_screen(nj.position, rect),
+                    ) {
+                        let d = point_to_segment_dist_2d(cursor, sa, sb);
+                        if d < best_elem_dist {
+                            best_elem_dist = d;
+                            app.hovered_element = Some(el.id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Workplane preview point for AddNode / DrawBeam tools
+        if app.tool != EditorTool::Select {
+            if let Some(nid) = app.hovered_node {
+                preview_point = app.model.get_node(nid).map(|n| n.position);
+            } else if let Some(mut hit) =
+                app.camera
+                    .intersect_horizontal_plane(cursor, rect, app.workplane_z)
+            {
+                if app.snap_grid > 1e-4 {
+                    hit[0] = (hit[0] / app.snap_grid).round() * app.snap_grid;
+                    hit[1] = (hit[1] / app.snap_grid).round() * app.snap_grid;
+                }
+                preview_point = Some(hit);
+            }
+        }
+    }
+
+    // Click handling
+    if response.clicked_by(egui::PointerButton::Secondary) && app.beam_draw_start.is_some() {
+        app.beam_draw_start = None;
+    }
+
+    if response.clicked_by(egui::PointerButton::Primary) {
+        match app.tool {
+            EditorTool::Select => {
+                if let Some(nid) = app.hovered_node {
+                    app.selected_node = Some(nid);
+                    app.selected_element = None;
+                } else if let Some(eid) = app.hovered_element {
+                    app.selected_element = Some(eid);
+                    app.selected_node = None;
+                } else {
+                    app.selected_node = None;
+                    app.selected_element = None;
+                }
+            }
+            EditorTool::AddNode => {
+                if let Some(pt) = preview_point {
+                    app.push_undo();
+                    let nid = app.model.find_or_add_node(pt, 1e-3);
+                    app.selected_node = Some(nid);
+                    app.selected_element = None;
+                    app.mark_model_changed();
+                    app.status_msg =
+                        format!("Placed Node N{nid} at ({:.2}, {:.2}, {:.2}) m", pt[0], pt[1], pt[2]);
+                }
+            }
+            EditorTool::DrawBeam => {
+                let target_nid = if let Some(nid) = app.hovered_node {
+                    Some(nid)
+                } else if let Some(pt) = preview_point {
+                    app.push_undo();
+                    let nid = app.model.find_or_add_node(pt, 1e-3);
+                    app.mark_model_changed();
+                    Some(nid)
+                } else {
+                    None
+                };
+
+                if let Some(nid) = target_nid {
+                    if let Some(start_nid) = app.beam_draw_start {
+                        if start_nid != nid {
+                            let sec_id = app.model.sections.first().map(|s| s.id).unwrap_or(1);
+                            let mat_id = app.model.materials.first().map(|m| m.id).unwrap_or(1);
+                            app.push_undo();
+                            if let Some(eid) = app.model.add_beam(start_nid, nid, mat_id, sec_id) {
+                                app.selected_element = Some(eid);
+                                app.selected_node = None;
+                                app.mark_model_changed();
+                                app.status_msg =
+                                    format!("Created Beam B{eid} (N{start_nid} → N{nid}). Right-click or Esc to end chain.");
+                            }
+                            app.beam_draw_start = Some(nid);
+                        }
+                    } else {
+                        app.beam_draw_start = Some(nid);
+                        app.status_msg = format!(
+                            "Start Node N{nid} selected — click another node or grid point to place beam."
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Build 3D scene geometry & render via wgpu
+    let anim_factor = if app.animate_deformed {
+        0.5 + 0.5 * app.anim_time.sin()
+    } else {
+        1.0
+    };
+
+    let disp_opts = ViewportDisplayOptions {
+        show_grid: app.show_grid,
+        workplane_z: app.workplane_z,
+        show_extruded: app.show_extruded,
+        profile_scale: app.profile_scale,
+        show_deformed: app.show_deformed,
+        show_undeformed_ghost: app.show_undeformed_ghost,
+        disp_scale: app.disp_scale * anim_factor,
+        show_supports: app.show_supports,
+        show_loads: app.show_loads,
+        show_reactions: app.show_reactions,
+        show_local_axes: app.show_local_axes,
+        color_field: app.color_field,
+        diagram_ribbon: app.diagram_ribbon,
+        diagram_scale: app.diagram_scale,
+        selected_node: app.selected_node,
+        hovered_node: app.hovered_node,
+        selected_element: app.selected_element,
+        hovered_element: app.hovered_element,
+        preview_point,
+        beam_draw_start_node: app.beam_draw_start,
+    };
+
+    let legend = build_scene_geometry(
+        &app.model,
+        app.solution.as_ref(),
+        &disp_opts,
+        &mut app.scene_geo,
+    );
+
+    if let (Some(render_state), Some(renderer)) =
+        (frame.wgpu_render_state(), app.renderer.as_mut())
+    {
+        let ppp = ui.ctx().pixels_per_point();
+        let pw = (rect.width() * ppp).round() as u32;
+        let ph = (rect.height() * ppp).round() as u32;
+        let aspect = rect.width() / rect.height().max(1.0);
+        let vp = app.camera.view_proj_matrix(aspect);
+        let eye = app.camera.eye_position();
+        let cam_uniform = CameraUniform {
+            view_proj: vp.into(),
+            eye_pos: [eye.x, eye.y, eye.z, 1.0],
+        };
+
+        renderer.render(
+            render_state,
+            pw,
+            ph,
+            &cam_uniform,
+            &app.scene_geo,
+            [0.075, 0.088, 0.114, 1.0],
+        );
+
+        ui.painter().image(
+            renderer.egui_tex_id,
+            rect,
+            Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    }
+
+    // 2D Vector HUD Overlays on top of the 3D Viewport
+    let painter = ui.painter_at(rect);
+
+    // Optional Node ID labels
+    if app.show_node_labels {
+        let eff_scale = if app.show_deformed && app.solution.is_some() {
+            app.disp_scale * anim_factor
+        } else {
+            0.0
+        };
+        for n in &app.model.nodes {
+            let mut p = n.position;
+            if eff_scale.abs() > 1e-9 {
+                if let Some(nr) = app.solution.as_ref().and_then(|s| s.node_results.get(&n.id)) {
+                    p[0] += eff_scale * nr.displacements[0];
+                    p[1] += eff_scale * nr.displacements[1];
+                    p[2] += eff_scale * nr.displacements[2];
+                }
+            }
+            if let Some((sp, _)) = app.camera.project_to_screen(p, rect) {
+                painter.text(
+                    sp + egui::vec2(6.0, -6.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("N{}", n.id),
+                    egui::FontId::monospace(11.0),
+                    Color32::from_rgb(225, 235, 250),
+                );
+            }
+        }
+    }
+
+    // Hover Tooltip Readout
+    if let Some(cursor) = response.hover_pos() {
+        if let Some(nid) = app.hovered_node {
+            if let Some(n) = app.model.get_node(nid) {
+                let mut tip = format!(
+                    "Node N{} ({:.2}, {:.2}, {:.2}) m",
+                    n.id, n.position[0], n.position[1], n.position[2]
+                );
+                if let Some(nr) = app.solution.as_ref().and_then(|s| s.node_results.get(&nid)) {
+                    let umag = (nr.displacements[0].powi(2)
+                        + nr.displacements[1].powi(2)
+                        + nr.displacements[2].powi(2))
+                    .sqrt()
+                        * 1e3;
+                    tip.push_str(&format!("\n|u| = {umag:.3} mm"));
+                }
+                draw_floating_badge(&painter, cursor + egui::vec2(14.0, 14.0), &tip);
+            }
+        } else if let Some(eid) = app.hovered_element {
+            if let Some(el) = app.model.get_element(eid) {
+                let sec_name = app
+                    .model
+                    .get_section(el.section_id)
+                    .map(|s| s.name.as_str())
+                    .unwrap_or("?");
+                let mut tip = format!("Beam B{} ({})", el.id, sec_name);
+                if let Some(er) = app
+                    .solution
+                    .as_ref()
+                    .and_then(|s| s.element_results.get(&eid))
+                {
+                    tip.push_str(&format!(
+                        "\nL = {:.2} m | Util = {:.1}%",
+                        er.length,
+                        er.max_utilization * 100.0
+                    ));
+                }
+                draw_floating_badge(&painter, cursor + egui::vec2(14.0, 14.0), &tip);
+            }
+        }
+    }
+
+    // Bottom-Left Orientation Gizmo Triad
+    draw_orientation_gizmo(&painter, &app.camera, rect);
+
+    // Bottom-Right Scientific Colorbar Legend
+    if let Some(leg) = legend {
+        draw_colorbar_legend(&painter, rect, leg);
+    }
+
+    // Top-Left Camera Preset Overlay Buttons
+    let overlay_rect = Rect::from_min_size(rect.min + egui::vec2(10.0, 10.0), egui::vec2(320.0, 30.0));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(overlay_rect), |ui| {
+        egui::Frame::NONE
+            .fill(Color32::from_rgba_unmultiplied(22, 27, 36, 210))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(52, 62, 80)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.small_button("⛶ Fit [F]").clicked() {
+                        let (min_p, max_p) = app.model.bounding_box();
+                        app.camera.fit_to_bounds(min_p, max_p);
+                    }
+                    if ui.small_button("Iso").clicked() {
+                        app.camera.set_preset_iso();
+                    }
+                    if ui.small_button("Front X-Z").clicked() {
+                        app.camera.set_preset_front_xz();
+                    }
+                    if ui.small_button("Side Y-Z").clicked() {
+                        app.camera.set_preset_side_yz();
+                    }
+                    if ui.small_button("Top X-Y").clicked() {
+                        app.camera.set_preset_top_xy();
+                    }
+                });
+            });
+    });
+}
+
+fn draw_floating_badge(painter: &egui::Painter, pos: Pos2, text: &str) {
+    let galley = painter.layout_no_wrap(
+        text.to_string(),
+        egui::FontId::monospace(11.5),
+        Color32::from_rgb(235, 242, 252),
+    );
+    let pad = egui::vec2(7.0, 5.0);
+    let box_rect = Rect::from_min_size(pos, galley.size() + pad * 2.0);
+    painter.rect_filled(
+        box_rect,
+        5.0,
+        Color32::from_rgba_unmultiplied(16, 20, 28, 230),
+    );
+    painter.rect_stroke(
+        box_rect,
+        5.0,
+        Stroke::new(1.0, Color32::from_rgb(80, 125, 190)),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(pos + pad, galley, Color32::WHITE);
+}
+
+fn draw_orientation_gizmo(painter: &egui::Painter, camera: &OrbitCamera, rect: Rect) {
+    let origin = egui::pos2(rect.left() + 46.0, rect.bottom() - 46.0);
+    let view = camera.view_matrix();
+    let len = 28.0;
+
+    let axes = [
+        (
+            nalgebra::Vector3::new(1.0, 0.0, 0.0),
+            "X",
+            Color32::from_rgb(245, 80, 80),
+        ),
+        (
+            nalgebra::Vector3::new(0.0, 1.0, 0.0),
+            "Y",
+            Color32::from_rgb(80, 225, 110),
+        ),
+        (
+            nalgebra::Vector3::new(0.0, 0.0, 1.0),
+            "Z",
+            Color32::from_rgb(85, 155, 255),
+        ),
+    ];
+
+    painter.circle_filled(origin, 34.0, Color32::from_rgba_unmultiplied(18, 22, 30, 175));
+
+    for (axis, lbl, col) in axes {
+        let v = view.transform_vector(&axis);
+        let tip = origin + egui::vec2(v.x * len, -v.y * len);
+        painter.line_segment([origin, tip], Stroke::new(2.2, col));
+        painter.text(
+            tip + egui::vec2(v.x * 7.0, -v.y * 7.0),
+            egui::Align2::CENTER_CENTER,
+            lbl,
+            egui::FontId::monospace(11.0),
+            col,
+        );
+    }
+}
+
+fn draw_colorbar_legend(painter: &egui::Painter, rect: Rect, leg: LegendRange) {
+    let panel_w = 215.0;
+    let panel_h = 54.0;
+    let panel = Rect::from_min_size(
+        egui::pos2(rect.right() - panel_w - 12.0, rect.bottom() - panel_h - 12.0),
+        egui::vec2(panel_w, panel_h),
+    );
+    painter.rect_filled(
+        panel,
+        6.0,
+        Color32::from_rgba_unmultiplied(18, 22, 30, 218),
+    );
+    painter.rect_stroke(
+        panel,
+        6.0,
+        Stroke::new(1.0, Color32::from_rgb(54, 65, 84)),
+        egui::StrokeKind::Inside,
+    );
+
+    painter.text(
+        egui::pos2(panel.left() + 8.0, panel.top() + 6.0),
+        egui::Align2::LEFT_TOP,
+        leg.field.label(),
+        egui::FontId::proportional(11.5),
+        Color32::from_rgb(215, 225, 242),
+    );
+
+    let bar = Rect::from_min_size(
+        egui::pos2(panel.left() + 8.0, panel.top() + 23.0),
+        egui::vec2(panel_w - 16.0, 11.0),
+    );
+    let n_strips = 36usize;
+    let strip_w = bar.width() / n_strips as f32;
+    for i in 0..n_strips {
+        let t = (i as f32 + 0.5) / n_strips as f32;
+        let rgba = if leg.diverging {
+            colormap_diverging(t * 2.0 - 1.0)
+        } else {
+            colormap_scientific(t)
+        };
+        let c = Color32::from_rgb(
+            (rgba[0] * 255.0) as u8,
+            (rgba[1] * 255.0) as u8,
+            (rgba[2] * 255.0) as u8,
+        );
+        let sr = Rect::from_min_size(
+            egui::pos2(bar.left() + i as f32 * strip_w, bar.top()),
+            egui::vec2(strip_w + 0.6, bar.height()),
+        );
+        painter.rect_filled(sr, 0.0, c);
+    }
+    painter.rect_stroke(
+        bar,
+        2.0,
+        Stroke::new(1.0, Color32::from_gray(90)),
+        egui::StrokeKind::Outside,
+    );
+
+    let unit = leg.field.unit();
+    let mid = 0.5 * (leg.min_display + leg.max_display);
+    painter.text(
+        egui::pos2(bar.left(), bar.bottom() + 3.0),
+        egui::Align2::LEFT_TOP,
+        format!("{:.2}", leg.min_display),
+        egui::FontId::monospace(10.0),
+        Color32::from_gray(185),
+    );
+    painter.text(
+        egui::pos2(bar.center().x, bar.bottom() + 3.0),
+        egui::Align2::CENTER_TOP,
+        format!("{mid:.2}"),
+        egui::FontId::monospace(10.0),
+        Color32::from_gray(165),
+    );
+    painter.text(
+        egui::pos2(bar.right(), bar.bottom() + 3.0),
+        egui::Align2::RIGHT_TOP,
+        format!("{:.2} {unit}", leg.max_display),
+        egui::FontId::monospace(10.0),
+        Color32::from_gray(215),
+    );
+}
+
+fn configure_engineering_theme(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = Color32::from_rgb(24, 28, 36);
+    visuals.window_fill = Color32::from_rgb(26, 31, 40);
+    visuals.extreme_bg_color = Color32::from_rgb(15, 18, 24);
+    visuals.faint_bg_color = Color32::from_rgb(30, 35, 45);
+    visuals.selection.bg_fill = Color32::from_rgb(48, 108, 185);
+    visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(28, 33, 43);
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(36, 43, 56);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(50, 62, 82);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(60, 118, 195);
+    ctx.set_visuals(visuals);
+}

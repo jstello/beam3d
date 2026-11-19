@@ -1,0 +1,526 @@
+use crate::model::{
+    DistributedLoad, GravitySettings, LoadCoordSystem, Material, NodalLoad, StructuralModel,
+    SupportPreset,
+};
+use crate::section::{CrossSection, SectionProfile};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateKind {
+    MultiStoryBuilding,
+    TiedArchBridge,
+    PitchedPortalFrame,
+    CrankedCantilever3D,
+    CantileverBenchmark,
+}
+
+impl TemplateKind {
+    pub const ALL: [TemplateKind; 5] = [
+        TemplateKind::MultiStoryBuilding,
+        TemplateKind::TiedArchBridge,
+        TemplateKind::PitchedPortalFrame,
+        TemplateKind::CrankedCantilever3D,
+        TemplateKind::CantileverBenchmark,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            TemplateKind::MultiStoryBuilding => "3D Braced Multi-Story Steel Frame",
+            TemplateKind::TiedArchBridge => "3D Tied-Arch Pedestrian Bridge",
+            TemplateKind::PitchedPortalFrame => "Pitched Roof Portal Frame (Snow + Wind)",
+            TemplateKind::CrankedCantilever3D => "3D L-Cantilever (Coupled Bending & Torsion)",
+            TemplateKind::CantileverBenchmark => "Cantilever Beam (Timoshenko Benchmark)",
+        }
+    }
+
+    pub fn build(self) -> StructuralModel {
+        match self {
+            TemplateKind::MultiStoryBuilding => multi_story_building(),
+            TemplateKind::TiedArchBridge => tied_arch_bridge(),
+            TemplateKind::PitchedPortalFrame => pitched_portal_frame(),
+            TemplateKind::CrankedCantilever3D => cranked_cantilever_3d(),
+            TemplateKind::CantileverBenchmark => cantilever_benchmark(),
+        }
+    }
+}
+
+pub fn multi_story_building() -> StructuralModel {
+    let mut m = StructuralModel {
+        name: "3-Story Braced Space Frame".to_string(),
+        description: "2x2 bay, 3-story structural steel frame with HEB columns, IPE girders, HSS lateral bracing, floor live loads, self-weight, and wind lateral loads.".to_string(),
+        nodes: Vec::new(),
+        materials: vec![Material::structural_steel_s355(1)],
+        sections: vec![
+            CrossSection {
+                id: 1,
+                name: "HEB 300 (Column)".to_string(),
+                profile: SectionProfile::IBeam {
+                    depth: 0.300,
+                    width: 0.300,
+                    web_thickness: 0.011,
+                    flange_thickness: 0.019,
+                },
+            },
+            CrossSection {
+                id: 2,
+                name: "IPE 330 (Girder)".to_string(),
+                profile: SectionProfile::IBeam {
+                    depth: 0.330,
+                    width: 0.160,
+                    web_thickness: 0.0075,
+                    flange_thickness: 0.0115,
+                },
+            },
+            CrossSection {
+                id: 3,
+                name: "HSS 140x140x8 (Brace)".to_string(),
+                profile: SectionProfile::HollowBox {
+                    depth: 0.140,
+                    width: 0.140,
+                    thickness: 0.008,
+                },
+            },
+        ],
+        elements: Vec::new(),
+        nodal_loads: Vec::new(),
+        distributed_loads: Vec::new(),
+        gravity: GravitySettings {
+            enabled: true,
+            acceleration: [0.0, 0.0, -9.80665],
+        },
+    };
+
+    let xs = [0.0, 6.0, 12.0];
+    let ys = [0.0, 5.5, 11.0];
+    let zs = [0.0, 4.0, 7.6, 11.2];
+
+    let mut grid = [[[0usize; 4]; 3]; 3];
+    for (iz, &z) in zs.iter().enumerate() {
+        for (iy, &y) in ys.iter().enumerate() {
+            for (ix, &x) in xs.iter().enumerate() {
+                let nid = m.add_node([x, y, z]);
+                grid[ix][iy][iz] = nid;
+                if iz == 0 {
+                    if let Some(node) = m.get_node_mut(nid) {
+                        node.restraints = SupportPreset::Fixed.to_restraints().unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    // Columns (section 1)
+    for ix in 0..3 {
+        for iy in 0..3 {
+            for iz in 0..3 {
+                m.add_beam(grid[ix][iy][iz], grid[ix][iy][iz + 1], 1, 1);
+            }
+        }
+    }
+
+    // X-direction primary girders (section 2) with uniform floor distributed loads
+    for iz in 1..=3 {
+        let qz = if iz == 3 { -12_000.0 } else { -22_000.0 }; // N/m
+        for iy in 0..3 {
+            for ix in 0..2 {
+                if let Some(eid) = m.add_beam(grid[ix][iy][iz], grid[ix + 1][iy][iz], 1, 2) {
+                    let dl_id = m.next_distributed_load_id();
+                    m.distributed_loads.push(DistributedLoad {
+                        id: dl_id,
+                        element_id: eid,
+                        coord_system: LoadCoordSystem::Global,
+                        q_start: [0.0, 0.0, qz],
+                        q_end: [0.0, 0.0, qz],
+                    });
+                }
+            }
+        }
+    }
+
+    // Y-direction girders (section 2)
+    for iz in 1..=3 {
+        let qz = if iz == 3 { -8_000.0 } else { -14_000.0 };
+        for ix in 0..3 {
+            for iy in 0..2 {
+                if let Some(eid) = m.add_beam(grid[ix][iy][iz], grid[ix][iy + 1][iz], 1, 2) {
+                    let dl_id = m.next_distributed_load_id();
+                    m.distributed_loads.push(DistributedLoad {
+                        id: dl_id,
+                        element_id: eid,
+                        coord_system: LoadCoordSystem::Global,
+                        q_start: [0.0, 0.0, qz],
+                        q_end: [0.0, 0.0, qz],
+                    });
+                }
+            }
+        }
+    }
+
+    // Pin-ended diagonal HSS braces in perimeter bays
+    for iz in 0..3 {
+        let pairs = [
+            (grid[0][0][iz], grid[1][0][iz + 1]),
+            (grid[2][2][iz], grid[1][2][iz + 1]),
+            (grid[0][0][iz], grid[0][1][iz + 1]),
+            (grid[2][2][iz], grid[2][1][iz + 1]),
+        ];
+        for (na, nb) in pairs {
+            if let Some(eid) = m.add_beam(na, nb, 1, 3) {
+                if let Some(el) = m.get_element_mut(eid) {
+                    // Release bending moments at both ends (ry, rz) so brace acts primarily axially
+                    el.releases_i = [false, false, false, false, true, true];
+                    el.releases_j = [false, false, false, false, true, true];
+                }
+            }
+        }
+    }
+
+    // Lateral wind loads on X=0 facade (+X + slight +Y oblique wind)
+    for iz in 1..=3 {
+        let fx = 38_000.0 * (iz as f64 / 2.0);
+        let fy = 12_000.0 * (iz as f64 / 2.0);
+        for iy in 0..3 {
+            let nl_id = m.next_nodal_load_id();
+            m.nodal_loads.push(NodalLoad {
+                id: nl_id,
+                node_id: grid[0][iy][iz],
+                forces: [fx, fy, 0.0],
+                moments: [0.0; 3],
+            });
+        }
+    }
+
+    m
+}
+
+pub fn tied_arch_bridge() -> StructuralModel {
+    let mut m = StructuralModel {
+        name: "3D Tied-Arch Pedestrian Bridge".to_string(),
+        description: "24 m span parabolic tubular steel arch bridge with I-beam tie girders, cross beams, pin-ended vertical hangers, crown wind bracing, and pedestrian deck loading.".to_string(),
+        nodes: Vec::new(),
+        materials: vec![Material::structural_steel_s355(1)],
+        sections: vec![
+            CrossSection {
+                id: 1,
+                name: "Pipe Ø355x16 (Arch Rib)".to_string(),
+                profile: SectionProfile::Pipe {
+                    outer_diameter: 0.355,
+                    thickness: 0.016,
+                },
+            },
+            CrossSection {
+                id: 2,
+                name: "IPE 450 (Tie Girder)".to_string(),
+                profile: SectionProfile::IBeam {
+                    depth: 0.450,
+                    width: 0.190,
+                    web_thickness: 0.0094,
+                    flange_thickness: 0.0146,
+                },
+            },
+            CrossSection {
+                id: 3,
+                name: "IPE 300 (Cross Beam)".to_string(),
+                profile: SectionProfile::IBeam {
+                    depth: 0.300,
+                    width: 0.150,
+                    web_thickness: 0.0071,
+                    flange_thickness: 0.0107,
+                },
+            },
+            CrossSection {
+                id: 4,
+                name: "Rod Ø50 (Hanger)".to_string(),
+                profile: SectionProfile::SolidCircle { diameter: 0.050 },
+            },
+            CrossSection {
+                id: 5,
+                name: "Pipe Ø168x8 (Crown Strut)".to_string(),
+                profile: SectionProfile::Pipe {
+                    outer_diameter: 0.168,
+                    thickness: 0.008,
+                },
+            },
+        ],
+        elements: Vec::new(),
+        nodal_loads: Vec::new(),
+        distributed_loads: Vec::new(),
+        gravity: GravitySettings {
+            enabled: true,
+            acceleration: [0.0, 0.0, -9.80665],
+        },
+    };
+
+    let span = 24.0;
+    let width = 4.2;
+    let rise = 5.2;
+    let n_panels = 8usize;
+
+    let mut deck_left = Vec::with_capacity(n_panels + 1);
+    let mut deck_right = Vec::with_capacity(n_panels + 1);
+    let mut arch_left = Vec::with_capacity(n_panels + 1);
+    let mut arch_right = Vec::with_capacity(n_panels + 1);
+
+    for i in 0..=n_panels {
+        let t = i as f64 / n_panels as f64;
+        let x = t * span;
+        let z_arch = 4.0 * rise * t * (1.0 - t);
+
+        let dl = m.add_node([x, 0.0, 0.0]);
+        let dr = m.add_node([x, width, 0.0]);
+        deck_left.push(dl);
+        deck_right.push(dr);
+
+        if i == 0 || i == n_panels {
+            arch_left.push(dl);
+            arch_right.push(dr);
+        } else {
+            arch_left.push(m.add_node([x, 0.0, z_arch]));
+            arch_right.push(m.add_node([x, width, z_arch]));
+        }
+    }
+
+    // Bridge bearings: pinned at x=0 left & right (with Y free on right), vertical rollers at x=span
+    if let Some(n) = m.get_node_mut(deck_left[0]) {
+        n.restraints = [true, true, true, false, false, false];
+    }
+    if let Some(n) = m.get_node_mut(deck_right[0]) {
+        n.restraints = [true, false, true, false, false, false];
+    }
+    if let Some(n) = m.get_node_mut(deck_left[n_panels]) {
+        n.restraints = [false, true, true, false, false, false];
+    }
+    if let Some(n) = m.get_node_mut(deck_right[n_panels]) {
+        n.restraints = [false, false, true, false, false, false];
+    }
+
+    // Tie girders (section 2) + asymmetric pedestrian + crowd loading
+    for i in 0..n_panels {
+        let q_left = if i < n_panels / 2 { -18_000.0 } else { -12_000.0 };
+        let q_right = -14_000.0;
+
+        if let Some(eid) = m.add_beam(deck_left[i], deck_left[i + 1], 1, 2) {
+            let lid = m.next_distributed_load_id();
+            m.distributed_loads.push(DistributedLoad {
+                id: lid,
+                element_id: eid,
+                coord_system: LoadCoordSystem::Global,
+                q_start: [0.0, 0.0, q_left],
+                q_end: [0.0, 0.0, q_left],
+            });
+        }
+        if let Some(eid) = m.add_beam(deck_right[i], deck_right[i + 1], 1, 2) {
+            let lid = m.next_distributed_load_id();
+            m.distributed_loads.push(DistributedLoad {
+                id: lid,
+                element_id: eid,
+                coord_system: LoadCoordSystem::Global,
+                q_start: [0.0, 0.0, q_right],
+                q_end: [0.0, 0.0, q_right],
+            });
+        }
+
+        // Arch rib segments (section 1)
+        m.add_beam(arch_left[i], arch_left[i + 1], 1, 1);
+        m.add_beam(arch_right[i], arch_right[i + 1], 1, 1);
+    }
+
+    // Transverse deck cross beams (section 3)
+    for i in 0..=n_panels {
+        m.add_beam(deck_left[i], deck_right[i], 1, 3);
+    }
+
+    // Vertical hangers (section 4, moment-released at top & bottom) + overhead arch struts
+    for i in 1..n_panels {
+        for &(dn, an) in &[(deck_left[i], arch_left[i]), (deck_right[i], arch_right[i])] {
+            if let Some(eid) = m.add_beam(dn, an, 1, 4) {
+                if let Some(el) = m.get_element_mut(eid) {
+                    el.releases_i = [false, false, false, false, true, true];
+                    el.releases_j = [false, false, false, false, true, true];
+                }
+            }
+        }
+        if (2..=n_panels - 2).contains(&i) {
+            m.add_beam(arch_left[i], arch_right[i], 1, 5);
+        }
+    }
+
+    // Crown K/X wind bracing between central arch ribs + lateral wind on arch
+    for i in 2..n_panels - 2 {
+        m.add_beam(arch_left[i], arch_right[i + 1], 1, 5);
+        m.add_beam(arch_right[i], arch_left[i + 1], 1, 5);
+        let nl_id = m.next_nodal_load_id();
+        m.nodal_loads.push(NodalLoad {
+            id: nl_id,
+            node_id: arch_left[i],
+            forces: [0.0, 15_000.0, 0.0],
+            moments: [0.0; 3],
+        });
+    }
+
+    m
+}
+
+pub fn pitched_portal_frame() -> StructuralModel {
+    let mut m = StructuralModel {
+        name: "Pitched Steel Portal Frame".to_string(),
+        description: "16 m clear-spanindustrial portal frame with pinned bases, IPE 400 columns & rafters, drifted trapezoidal roof snow load, and windward column pressure.".to_string(),
+        nodes: Vec::new(),
+        materials: vec![Material::structural_steel_s355(1)],
+        sections: vec![CrossSection {
+            id: 1,
+            name: "IPE 400".to_string(),
+            profile: SectionProfile::IBeam {
+                depth: 0.400,
+                width: 0.180,
+                web_thickness: 0.0086,
+                flange_thickness: 0.0135,
+            },
+        }],
+        elements: Vec::new(),
+        nodal_loads: Vec::new(),
+        distributed_loads: Vec::new(),
+        gravity: GravitySettings {
+            enabled: true,
+            acceleration: [0.0, 0.0, -9.80665],
+        },
+    };
+
+    let n1 = m.add_node([0.0, 0.0, 0.0]);
+    let n2 = m.add_node([0.0, 0.0, 6.0]);
+    let n3 = m.add_node([8.0, 0.0, 8.2]);
+    let n4 = m.add_node([16.0, 0.0, 6.0]);
+    let n5 = m.add_node([16.0, 0.0, 0.0]);
+
+    // Restrain out-of-plane Y & Rx/Rz at eaves/apex for 2D planar stability, pinned bases in X-Z
+    for &nid in &[n1, n5] {
+        if let Some(n) = m.get_node_mut(nid) {
+            n.restraints = [true, true, true, true, false, true];
+        }
+    }
+    for &nid in &[n2, n3, n4] {
+        if let Some(n) = m.get_node_mut(nid) {
+            n.restraints = [false, true, false, true, false, true];
+        }
+    }
+
+    let c1 = m.add_beam(n1, n2, 1, 1).unwrap();
+    let r1 = m.add_beam(n2, n3, 1, 1).unwrap();
+    let r2 = m.add_beam(n3, n4, 1, 1).unwrap();
+    let _c2 = m.add_beam(n5, n4, 1, 1).unwrap();
+
+    // Windward horizontal pressure on left column (+X)
+    m.distributed_loads.push(DistributedLoad {
+        id: 1,
+        element_id: c1,
+        coord_system: LoadCoordSystem::Global,
+        q_start: [6_000.0, 0.0, 0.0],
+        q_end: [9_500.0, 0.0, 0.0],
+    });
+    // Trapezoidal drifted snow load on rafters (-Z)
+    m.distributed_loads.push(DistributedLoad {
+        id: 2,
+        element_id: r1,
+        coord_system: LoadCoordSystem::Global,
+        q_start: [0.0, 0.0, -14_000.0],
+        q_end: [0.0, 0.0, -22_000.0],
+    });
+    m.distributed_loads.push(DistributedLoad {
+        id: 3,
+        element_id: r2,
+        coord_system: LoadCoordSystem::Global,
+        q_start: [0.0, 0.0, -28_000.0],
+        q_end: [0.0, 0.0, -16_000.0],
+    });
+
+    m
+}
+
+pub fn cranked_cantilever_3d() -> StructuralModel {
+    let mut m = StructuralModel {
+        name: "3D L-Shaped Cranked Cantilever".to_string(),
+        description: "Right-angle horizontal space cantilever subjected to vertical tip force and self-weight, inducing simultaneous bending, shear, and St. Venant torsion in leg 1.".to_string(),
+        nodes: Vec::new(),
+        materials: vec![Material::structural_steel_s355(1)],
+        sections: vec![CrossSection {
+            id: 1,
+            name: "HSS 250x150x10".to_string(),
+            profile: SectionProfile::HollowBox {
+                depth: 0.250,
+                width: 0.150,
+                thickness: 0.010,
+            },
+        }],
+        elements: Vec::new(),
+        nodal_loads: Vec::new(),
+        distributed_loads: Vec::new(),
+        gravity: GravitySettings {
+            enabled: true,
+            acceleration: [0.0, 0.0, -9.80665],
+        },
+    };
+
+    let n1 = m.add_node([0.0, 0.0, 2.0]);
+    let n2 = m.add_node([4.0, 0.0, 2.0]);
+    let n3 = m.add_node([4.0, 3.0, 2.0]);
+
+    if let Some(n) = m.get_node_mut(n1) {
+        n.restraints = [true; 6];
+    }
+
+    let e1 = m.add_beam(n1, n2, 1, 1).unwrap();
+    let e2 = m.add_beam(n2, n3, 1, 1).unwrap();
+
+    // Subdivide for visual node markers if desired, though stations already interpolate smoothly
+    let _ = (e1, e2);
+
+    m.nodal_loads.push(NodalLoad {
+        id: 1,
+        node_id: n3,
+        forces: [0.0, 0.0, -35_000.0],
+        moments: [0.0, 0.0, 0.0],
+    });
+
+    m
+}
+
+pub fn cantilever_benchmark() -> StructuralModel {
+    let mut m = StructuralModel {
+        name: "Cantilever Beam Benchmark".to_string(),
+        description: "3.0 m deep I-beam cantilever (HEA 400) with 100 kN downward tip load. Switch between Timoshenko and Euler-Bernoulli in the inspector to compare shear + bending deflection!".to_string(),
+        nodes: Vec::new(),
+        materials: vec![Material::structural_steel_s355(1)],
+        sections: vec![CrossSection {
+            id: 1,
+            name: "HEA 400".to_string(),
+            profile: SectionProfile::IBeam {
+                depth: 0.390,
+                width: 0.300,
+                web_thickness: 0.011,
+                flange_thickness: 0.019,
+            },
+        }],
+        elements: Vec::new(),
+        nodal_loads: Vec::new(),
+        distributed_loads: Vec::new(),
+        gravity: GravitySettings {
+            enabled: false,
+            acceleration: [0.0, 0.0, -9.80665],
+        },
+    };
+
+    let n1 = m.add_node([0.0, 0.0, 1.5]);
+    let n2 = m.add_node([3.0, 0.0, 1.5]);
+    if let Some(n) = m.get_node_mut(n1) {
+        n.restraints = [true; 6];
+    }
+
+    let _b1 = m.add_beam(n1, n2, 1, 1).unwrap();
+    m.nodal_loads.push(NodalLoad {
+        id: 1,
+        node_id: n2,
+        forces: [0.0, 0.0, -100_000.0],
+        moments: [0.0; 3],
+    });
+
+    m
+}
