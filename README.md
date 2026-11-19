@@ -25,6 +25,11 @@ cargo test --workspace
 cargo run --release -p beam3d-ui
 ```
 
+## Tutorials & How to Draw in 3D
+
+- **In-App Interactive Coach:** Click **`🎓 Tutorials`** in the top toolbar to launch step-by-step live-checked tutorials (including *How to Draw in 3D*, *Post-Processing*, *Sections/Roll/Hinges*, and *Timoshenko Shear*).
+- **Written Guide:** See [docs/TUTORIALS.md](docs/TUTORIALS.md) for a complete walkthrough of 3D workplane drawing, magnetic node snapping, column extrusion, supports, loads, hinges, and post-processing.
+
 ## Viewport Controls
 
 | Action | Control |
@@ -33,6 +38,7 @@ cargo run --release -p beam3d-ui
 | **Pan** | Middle-drag or `Shift` + Drag |
 | **Zoom** | Scroll wheel / two-finger trackpad scroll |
 | **Fit to Model** | `F` key or `⛶ Fit [F]` button |
+| **Step 3D Workplane `Z` Up / Down** | `]` / `[` keys (or top-right 3D Drawing HUD) |
 | **Delete Selected** | `Delete` / `Backspace` |
 | **Undo / Redo** | `Cmd+Z` / `Cmd+Shift+Z` |
 | **End Beam Chain** | `Esc` or Right-click |

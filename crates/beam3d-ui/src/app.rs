@@ -5,6 +5,7 @@ use crate::mesh_gen::{
 };
 use crate::panels::{draw_bottom_panel, draw_left_panel, draw_right_panel};
 use crate::renderer::{CameraUniform, SceneGeometry, ViewportRenderer};
+use crate::tutorials::{TutorialState, TutorialTrack, draw_tutorial_window, start_tutorial};
 use beam3d_core::{Solution, StructuralModel, TemplateKind, solve_linear_static};
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, RichText, Stroke};
 
@@ -55,6 +56,8 @@ pub struct Beam3dApp {
     pub beam_draw_start: Option<usize>,
     pub workplane_z: f64,
     pub snap_grid: f64,
+    pub extrude_dz: f64,
+    pub tutorial: TutorialState,
 
     pub left_tab: LeftTab,
     pub bottom_tab: BottomTab,
@@ -119,6 +122,8 @@ impl Beam3dApp {
             beam_draw_start: None,
             workplane_z: 0.0,
             snap_grid: 0.5,
+            extrude_dz: 3.0,
+            tutorial: TutorialState::default(),
             left_tab: LeftTab::Structure,
             bottom_tab: BottomTab::MemberDiagrams,
             show_bottom_panel: true,
@@ -320,6 +325,17 @@ impl eframe::App for Beam3dApp {
                         self.save_json_dialog();
                     }
 
+                    egui::ComboBox::from_id_salt("tutorials_menu")
+                        .selected_text("🎓 Tutorials")
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for track in TutorialTrack::ALL {
+                                if ui.selectable_label(false, track.title()).clicked() {
+                                    start_tutorial(self, track);
+                                }
+                            }
+                        });
+
                     ui.separator();
                     if ui
                         .add_enabled(!self.undo_stack.is_empty(), egui::Button::new("↶ Undo"))
@@ -444,6 +460,9 @@ impl eframe::App for Beam3dApp {
             .show(ui, |ui| {
                 draw_central_3d_viewport(self, ui, frame);
             });
+
+        // 7. Interactive Guided Tutorial Window (when active)
+        draw_tutorial_window(self, &ctx);
     }
 }
 
@@ -455,6 +474,19 @@ fn handle_global_shortcuts(app: &mut Beam3dApp, ctx: &egui::Context) {
         if i.key_pressed(egui::Key::F) {
             let (min_p, max_p) = app.model.bounding_box();
             app.camera.fit_to_bounds(min_p, max_p);
+        }
+        let z_step = if app.snap_grid > 1e-3 {
+            app.snap_grid
+        } else {
+            0.5
+        };
+        if i.key_pressed(egui::Key::CloseBracket) {
+            app.workplane_z += z_step;
+            app.status_msg = format!("Raised 3D Workplane Z to {:.2} m", app.workplane_z);
+        }
+        if i.key_pressed(egui::Key::OpenBracket) {
+            app.workplane_z -= z_step;
+            app.status_msg = format!("Lowered 3D Workplane Z to {:.2} m", app.workplane_z);
         }
         if i.key_pressed(egui::Key::Escape) {
             if app.beam_draw_start.is_some() {
@@ -813,6 +845,73 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
                 });
             });
     });
+
+    // Top-Right 3D Drawing HUD when AddNode or DrawBeam tool is active
+    if app.tool != EditorTool::Select {
+        let hud_w = 345.0;
+        let hud_rect = Rect::from_min_size(
+            egui::pos2(rect.right() - hud_w - 10.0, rect.top() + 10.0),
+            egui::vec2(hud_w, 64.0),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(hud_rect), |ui| {
+            egui::Frame::NONE
+                .fill(Color32::from_rgba_unmultiplied(18, 28, 42, 228))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(8, 5))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(70, 145, 225)))
+                .show(ui, |ui| {
+                    let mode_name = match app.tool {
+                        EditorTool::AddNode => "⊕ ADD NODE MODE",
+                        EditorTool::DrawBeam => "📏 DRAW BEAM MODE",
+                        EditorTool::Select => "",
+                    };
+                    let coord_str = if let Some(nid) = app.hovered_node {
+                        format!("Snap → Node N{nid}")
+                    } else if let Some(pt) = preview_point {
+                        format!("XYZ: ({:.2}, {:.2}, {:.2}) m", pt[0], pt[1], pt[2])
+                    } else {
+                        format!("Workplane Z = {:.2} m", app.workplane_z)
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(mode_name)
+                                .small()
+                                .strong()
+                                .color(Color32::from_rgb(100, 220, 255)),
+                        );
+                        ui.separator();
+                        ui.label(
+                            RichText::new(coord_str)
+                                .monospace()
+                                .small()
+                                .color(Color32::from_rgb(225, 238, 255)),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Workplane Z:").small());
+                        for z_preset in [0.0, 3.0, 6.0] {
+                            let active = (app.workplane_z - z_preset).abs() < 1e-3;
+                            if ui
+                                .selectable_label(active, format!("{z_preset:.0}m"))
+                                .clicked()
+                            {
+                                app.workplane_z = z_preset;
+                            }
+                        }
+                        let step = app.snap_grid.max(0.5);
+                        if ui.small_button("-Z [").clicked() {
+                            app.workplane_z -= step;
+                        }
+                        if ui.small_button("+Z ]").clicked() {
+                            app.workplane_z += step;
+                        }
+                        if app.beam_draw_start.is_some() && ui.small_button("End Chain").clicked() {
+                            app.beam_draw_start = None;
+                        }
+                    });
+                });
+        });
+    }
 }
 
 fn draw_floating_badge(painter: &egui::Painter, pos: Pos2, text: &str) {

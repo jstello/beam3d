@@ -550,7 +550,7 @@ pub fn build_scene_geometry(
         }
     }
 
-    // 7. Interactive AddNode / DrawBeam 3D Cursor Preview
+    // 7. Interactive AddNode / DrawBeam 3D Cursor Preview + Vertical Z Plumb-Line
     if let Some(pt) = opts.preview_point {
         let p = Vector3::from(to_f32(pt));
         push_octahedron(
@@ -559,6 +559,15 @@ pub fn build_scene_geometry(
             glyph_size * 0.36,
             [0.25, 0.92, 0.98, 0.92],
         );
+        if pt[2].abs() > 1e-3 {
+            // Vertical plumb-line to ground Z=0 so elevated 3D points align effortlessly over ground nodes
+            push_line(
+                &mut out.lines,
+                [p.x, p.y, 0.0],
+                p.into(),
+                [0.25, 0.85, 0.98, 0.55],
+            );
+        }
         if let Some(start_id) = opts.beam_draw_start_node {
             if let Some(sn) = model.get_node(start_id) {
                 push_line(

@@ -995,10 +995,11 @@ fn draw_node_inspector(app: &mut Beam3dApp, ui: &mut egui::Ui, nid: usize) {
     };
 
     let mut changed = false;
+    let mut extrude_from_node: Option<([f64; 3], f64)> = None;
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("Node N{nid}")).strong());
-            if ui.small_button("+ Add Nodal Load").clicked() {
+            if ui.small_button("+ Nodal Load").clicked() {
                 app.push_undo();
                 let lid = app.model.next_nodal_load_id();
                 app.model.nodal_loads.push(NodalLoad {
@@ -1009,6 +1010,24 @@ fn draw_node_inspector(app: &mut Beam3dApp, ui: &mut egui::Ui, nid: usize) {
                 });
                 app.left_tab = LeftTab::Loads;
                 changed = true;
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("ΔZ:");
+            ui.add(
+                egui::DragValue::new(&mut app.extrude_dz)
+                    .speed(0.25)
+                    .range(-50.0..=50.0)
+                    .suffix(" m"),
+            );
+            if ui
+                .small_button("⬆ Extrude Column (+ΔZ)")
+                .on_hover_text("Create a node offset by ΔZ and connect a vertical beam")
+                .clicked()
+                && app.extrude_dz.abs() > 1e-3
+            {
+                extrude_from_node = Some((node_clone.position, app.extrude_dz));
             }
         });
 
@@ -1106,6 +1125,22 @@ fn draw_node_inspector(app: &mut Beam3dApp, ui: &mut egui::Ui, nid: usize) {
             }
         }
     });
+
+    if let Some((pos, dz)) = extrude_from_node {
+        let top_pos = [pos[0], pos[1], pos[2] + dz];
+        let sec_id = app.model.sections.first().map(|s| s.id).unwrap_or(1);
+        let mat_id = app.model.materials.first().map(|m| m.id).unwrap_or(1);
+        app.push_undo();
+        let top_nid = app.model.find_or_add_node(top_pos, 1e-3);
+        if let Some(eid) = app.model.add_beam(nid, top_nid, mat_id, sec_id) {
+            app.selected_node = Some(top_nid);
+            app.status_msg = format!(
+                "Extruded Column B{eid} from N{nid} to N{top_nid} at Z = {:.2} m.",
+                top_pos[2]
+            );
+        }
+        changed = true;
+    }
 
     if changed {
         app.mark_model_changed();

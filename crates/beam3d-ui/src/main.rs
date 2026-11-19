@@ -3,6 +3,7 @@ mod camera;
 mod mesh_gen;
 mod panels;
 mod renderer;
+mod tutorials;
 
 use app::Beam3dApp;
 use eframe::egui;
