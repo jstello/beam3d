@@ -38,7 +38,8 @@ cargo run --release -p beam3d-ui
 | **Pan** | Middle-drag or `Shift` + Drag |
 | **Zoom** | Scroll wheel / two-finger trackpad scroll |
 | **Fit to Model** | `F` key or `⛶ Fit [F]` button |
-| **Step 3D Workplane `Z` Up / Down** | `]` / `[` keys (or top-right 3D Drawing HUD) |
+| **Cycle Working Plane (`XY` → `XZ` → `YZ`)** | `P` key or `Plane: XY / XZ / YZ` buttons |
+| **Step Plane Offset (`Z`, `Y`, or `X`)** | `]` / `[` keys (or top-right 3D Drawing HUD) |
 | **Delete Selected** | `Delete` / `Backspace` |
 | **Undo / Redo** | `Cmd+Z` / `Cmd+Shift+Z` |
 | **End Beam Chain** | `Esc` or Right-click |

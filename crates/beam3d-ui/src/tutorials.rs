@@ -1,4 +1,5 @@
 use crate::app::{Beam3dApp, EditorTool, LeftTab};
+use crate::camera::WorkplaneKind;
 use crate::mesh_gen::{ColorField, DiagramRibbon};
 use beam3d_core::{StructuralModel, TemplateKind};
 use eframe::egui::{self, Color32, RichText};
@@ -70,7 +71,8 @@ pub fn start_tutorial(app: &mut Beam3dApp, track: TutorialTrack) {
             app.load_model(empty, "Started Tutorial: How to Draw in 3D.");
             app.camera.target = nalgebra::Vector3::new(2.0, 2.0, 1.5);
             app.camera.distance = 14.0;
-            app.workplane_z = 0.0;
+            app.workplane_kind = WorkplaneKind::XY;
+            app.workplane_offset = 0.0;
             app.snap_grid = 1.0;
             app.tool = EditorTool::AddNode;
             app.show_node_labels = true;
@@ -276,16 +278,22 @@ fn evaluate_steps(app: &Beam3dApp, track: TutorialTrack) -> Vec<StepSpec> {
                     quick_action_label: Some("⚡ Auto-place 4 ground nodes for me"),
                 },
                 StepSpec {
-                    title: "Raise the 3D Workplane to Z = 3.0 m",
-                    instructions: "To draw upward in 3D, raise the horizontal construction grid!\n\n• Press the ']' key three times (each press steps Z up by Snap),\n• OR click the '3m' / '+Z' button in the top-right 3D Drawing HUD,\n• OR drag 'Z:' in the top toolbar to 3.0 m.",
-                    tip: "Watch the 3D grid plane physically rise to elevation Z = 3.0 m! '[' lowers Z back down.",
-                    completed: app.workplane_z >= 2.5,
-                    progress_label: Some(format!("Current Workplane Z = {:.2} m (Target: ≥ 3.0 m)", app.workplane_z)),
-                    quick_action_label: Some("⚡ Set Workplane Z = 3.0 m & switch to Draw Beam"),
+                    title: "Switch to a Vertical Plane (XZ or YZ) for Columns",
+                    instructions: "To draw vertical columns straight upward in 3D, switch the working plane from horizontal XY to vertical XZ or YZ!\n\n• Click 'XZ' or 'YZ' next to 'Plane:' in the top bar (or in the top-right HUD),\n• OR press the 'P' key to cycle XY → XZ → YZ!",
+                    tip: "Notice the upright blue (XZ) or green (YZ) vertical grid! Whenever you pick a start node in 'Draw Beam', the vertical plane automatically slides right through that node.",
+                    completed: app.workplane_kind != WorkplaneKind::XY
+                        || (app.workplane_kind == WorkplaneKind::XY && app.workplane_offset >= 2.5),
+                    progress_label: Some(format!(
+                        "Active Plane: {} ({} = {:.2} m)",
+                        app.workplane_kind.full_label(),
+                        app.workplane_kind.normal_axis_name(),
+                        app.workplane_offset
+                    )),
+                    quick_action_label: Some("⚡ Switch to Vertical XZ Plane & Draw Beam"),
                 },
                 StepSpec {
                     title: "Draw Vertical Columns & Roof Beams",
-                    instructions: "Existing nodes magnetically snap in full 3D even when your Workplane Z is higher!\n\n1. Select '📏 Draw Beam' in the top bar.\n2. Click ground node N1 (0,0,0), then click directly above it on the Z=3m grid (0,0,3) to create a vertical column!\n3. Continue clicking around the Z=3m grid to chain roof beams, and press Esc (or Right-click) to end a chain and connect the remaining columns.",
+                    instructions: "1. Select '📏 Draw Beam' (with Plane = XZ).\n2. Click ground node N1 (0,0,0) — the vertical XZ grid aligns through N1! Move straight up to Z = 3 m and click (0,0,3) to create Column B1.\n3. Repeat for the other ground nodes (press Esc to end a chain), then press 'P' back to 'XY' (auto-aligns at Z = 3 m!) to connect the 4 roof girders!",
                     tip: "You can also select any ground node and click '⬆ Extrude Column (+ΔZ)' in the Right Inspector!",
                     completed: upper_nodes >= 4 && n_beams >= 6,
                     progress_label: Some(format!("Upper nodes (Z ≥ 2m): {upper_nodes}/4  |  Beams drawn: {n_beams}/8")),
@@ -420,7 +428,7 @@ fn run_quick_helper(app: &mut Beam3dApp, track: TutorialTrack, step: usize) {
             app.mark_model_changed();
         }
         (TutorialTrack::Draw3dSpaceFrame, 1) => {
-            app.workplane_z = 3.0;
+            app.set_workplane_kind(WorkplaneKind::XZ);
             app.tool = EditorTool::DrawBeam;
         }
         (TutorialTrack::Draw3dSpaceFrame, 3) => {

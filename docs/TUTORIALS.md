@@ -28,15 +28,21 @@ Beam3D uses a right-handed **Z-up** structural engineering coordinate system:
 
 ## Tutorial 1: How to Draw in 3D (Build a Space Frame from Scratch)
 
-Because a computer screen is 2D, 3D structural CAD tools combine **two mechanisms** to place points accurately in 3D space:
-1. **Adjustable Horizontal Workplane (`Z`) + Grid Snap:** Unsnapped clicks land on the horizontal construction grid at elevation `Z = Workplane Z`, rounded to `Snap` increments.
-2. **3D Magnetic Node Snapping:** Hovering near *any* existing node (at any `Z` elevation!) magnetically snaps your cursor to that 3D node (`Snap → Node N#`), overriding the workplane.
+Beam3D supports **all three orthogonal 3D working planes** plus automatic node alignment:
+1. **Switchable 3D Working Planes (`XY`, `XZ`, `YZ`):**
+   - **`XY` (Floor Plane, normal `Z`):** Slate horizontal grid for floor plans and roof girders.
+   - **`XZ` (Front Vertical Plane, normal `Y`):** Upright blue grid for drawing vertical columns, portal frames, and trusses in `X–Z`.
+   - **`YZ` (Side Vertical Plane, normal `X`):** Upright green grid for drawing vertical side frames and columns in `Y–Z`.
+   - Switch anytime using **`Plane: [XY] [XZ] [YZ]`** in the top bar (always visible!), the top-right 3D Drawing HUD, or by pressing **`P`** on your keyboard!
+2. **Smart Start-Node Plane Alignment & 3D Magnetic Snapping:**
+   - Hovering near *any* existing node magnetically snaps your cursor to that 3D node (`Snap → Node N#`).
+   - Whenever you pick a start node in **`📏 Draw Beam`** (or switch planes while a node is selected), the active plane **automatically slides to pass directly through that node** — so clicking any ground node `(x, y, 0)` in `XZ` or `YZ` mode immediately lets you draw a vertical column straight up to `(x, y, H)`!
 
 ```mermaid
 flowchart LR
-    A["1. Set Z = 0m\nPlace Ground Nodes"] --> B["2. Press ']' to Raise\nWorkplane to Z = 3m"]
-    B --> C["3. Draw Beam: Click Ground Node\n→ Click Z = 3m Grid Above"]
-    C --> D["4. Chain Roof Girders\nPress Esc to End Chain"]
+    A["1. Plane = XY (Z=0)\nPlace Ground Nodes"] --> B["2. Press 'P' → Plane = XZ\n(Vertical Grid)"]
+    B --> C["3. Draw Beam: Click Ground Node\n→ Click Straight Up at Z = 3m"]
+    C --> D["4. Press 'P' → Plane = XY\n(Auto-aligns at Z = 3m!) & Chain Roof"]
     D --> E["5. Add Supports, Loads\n& Click Solve FEA"]
 ```
 
@@ -46,29 +52,22 @@ flowchart LR
    - Click **`📂 Templates...` → `✨ New Empty Model`**.
    - Check **`Labels`** in the Right Panel (`🎨 3D Post-Processor & View`) so `N1`, `N2`, ... are visible in 3D.
 
-2. **Place the 4 Column Base Nodes at Ground (`Z = 0 m`)**
-   - Click **`⊕ Add Node`** in the top toolbar.
-   - Notice the blue **3D Drawing HUD** appears at the top-right of the viewport showing your live snapped `XYZ` coordinates.
-   - Set **`Snap: 1.0 m`** and ensure **`Workplane Z: 0m`** is active.
-   - Left-click four corners on the grid:
-     - `(0, 0, 0)` → creates `N1`
-     - `(4, 0, 0)` → creates `N2`
-     - `(4, 4, 0)` → creates `N3`
-     - `(0, 4, 0)` → creates `N4`
+2. **Place the 4 Column Base Nodes on the `XY` Floor Plane (`Z = 0 m`)**
+   - Click **`⊕ Add Node`** in the top toolbar (with **`Plane: XY`** and **`Z: 0.0m`**).
+   - Set **`Snap: 1.0 m`**.
+   - Left-click four corners on the floor grid: `(0, 0, 0)`, `(4, 0, 0)`, `(4, 4, 0)`, and `(0, 4, 0)` → creates `N1..N4`.
    - *(Tip: **Right-drag** anytime to orbit the 3D camera without placing a node!)*
 
-3. **Raise the 3D Workplane to Roof Level (`Z = 3.0 m`)**
-   - Press **`]`** three times on your keyboard (or click **`3m`** in the top-right 3D Drawing HUD).
-   - Watch the 3D grid physically rise to `Z = 3.0 m`!
-   - Move your cursor around the viewport: notice the cyan **vertical plumb-line** dropping from your elevated `(X, Y, 3.0)` cursor down to `Z = 0` so you can line up directly above ground nodes.
+3. **Switch to the Vertical `XZ` Plane to Draw Vertical Columns**
+   - Click **`📏 Draw Beam`** in the top toolbar.
+   - Press **`P`** (or click **`XZ`** next to `Plane:` in the top bar) — an upright blue vertical grid appears!
+   - Click ground node **`N1`** `(0, 0, 0)` — the vertical `XZ` grid automatically aligns through `N1` (`Y = 0 m`). Move your cursor straight up along the vertical grid line to `(0, 0, 3.0)` and click → **Vertical Column `B1` (`N1 → N5`) is created!**
+   - Press **`Esc`** (or **Right-click**) to end the chain.
+   - Click ground node **`N3`** `(4, 4, 0)` — watch the vertical `XZ` grid **automatically slide to `Y = 4.0 m`** right through `N3`! Move straight up to `(4, 4, 3.0)` and click → **Vertical Column `N3 → N7` is created!** Repeat for `N2` and `N4`.
 
-4. **Draw Vertical Columns & Chain Roof Girders**
-   - Click **`📏 Draw Beam`** in the top toolbar:
-     1. Hover over ground node **`N1`** `(0, 0, 0)` — the HUD reads `Snap → Node N1` — and **Left-click**.
-     2. Move straight up to `(0, 0, 3.0)` on the elevated grid (watch the vertical plumb-line touch `N1`!) and **Left-click** → **Column `B1` (`N1 → N5`) is created!**
-     3. Because **`Draw Beam` automatically chains**, your start node is now `N5` `(0, 0, 3)`. Click `(4, 0, 3)`, then `(4, 4, 3)`, then `(0, 4, 3)`, then click **`N5`** again to close the entire 4-girder roof perimeter in four clicks!
-     4. Press **`Esc`** (or **Right-click**, or click **`End Chain`** in the HUD) to stop chaining.
-     5. Connect the remaining three vertical columns (`N2 → N6`, `N3 → N7`, `N4 → N8`), pressing `Esc` after each column.
+4. **Switch Back to `XY` to Close the Roof Girders**
+   - With a column top node active (at `Z = 3.0 m`), press **`P`** until **`Plane: XY`** is active — the horizontal `XY` grid automatically jumps up to **`Z = 3.0 m`** (roof level)!
+   - Click around the four column tops `N5 → N6 → N7 → N8 → N5` to chain all 4 roof girders, then press **`Esc`**.
 
    > **Shortcut — One-Click Column Extrusion:** Instead of raising the workplane manually, you can also select any ground node with **`🖱 Select`**, set **`ΔZ: 3.0 m`** in the Right Panel (`Selection Inspector`), and click **`⬆ Extrude Column (+ΔZ)`** to create the upper node and vertical column in a single click!
 

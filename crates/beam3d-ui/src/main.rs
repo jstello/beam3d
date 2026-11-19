@@ -26,7 +26,7 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::camera::OrbitCamera;
+    use crate::camera::{OrbitCamera, WorkplaneKind};
     use crate::mesh_gen::{
         ColorField, DiagramRibbon, ViewportDisplayOptions, build_scene_geometry,
     };
@@ -50,11 +50,41 @@ mod tests {
                 (sol_orig.summary.max_displacement_m - sol.summary.max_displacement_m).abs()
                     < 1e-12
             );
+            for wp in WorkplaneKind::ALL {
+                let opts = ViewportDisplayOptions {
+                    show_grid: true,
+                    workplane_kind: wp,
+                    workplane_offset: 1.5,
+                    show_extruded: true,
+                    profile_scale: 1.0,
+                    show_deformed: true,
+                    show_undeformed_ghost: true,
+                    disp_scale: 25.0,
+                    show_supports: true,
+                    show_loads: true,
+                    show_reactions: true,
+                    show_local_axes: true,
+                    color_field: ColorField::VonMisesStress,
+                    diagram_ribbon: DiagramRibbon::MomentMy,
+                    diagram_scale: 1.0,
+                    selected_node: parsed.nodes.first().map(|n| n.id),
+                    hovered_node: None,
+                    selected_element: parsed.elements.first().map(|e| e.id),
+                    hovered_element: None,
+                    preview_point: Some([1.0, 2.0, 1.5]),
+                    beam_draw_start_node: parsed.nodes.first().map(|n| n.id),
+                };
+                build_scene_geometry(&parsed, Some(&sol), &opts, &mut scene);
+                assert!(!scene.opaque_tris.is_empty());
+                assert!(!scene.lines.is_empty());
+            }
+
             for cf in ColorField::ALL {
                 for ribbon in DiagramRibbon::ALL {
                     let opts = ViewportDisplayOptions {
                         show_grid: true,
-                        workplane_z: 0.0,
+                        workplane_kind: WorkplaneKind::XY,
+                        workplane_offset: 0.0,
                         show_extruded: true,
                         profile_scale: 1.0,
                         show_deformed: true,
@@ -139,7 +169,8 @@ mod tests {
         let mut scene = SceneGeometry::default();
         let opts = ViewportDisplayOptions {
             show_grid: true,
-            workplane_z: 0.0,
+            workplane_kind: WorkplaneKind::XZ,
+            workplane_offset: 0.0,
             show_extruded: true,
             profile_scale: 1.0,
             show_deformed: true,

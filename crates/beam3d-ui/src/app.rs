@@ -1,4 +1,4 @@
-use crate::camera::{OrbitCamera, point_to_segment_dist_2d};
+use crate::camera::{OrbitCamera, WorkplaneKind, point_to_segment_dist_2d};
 use crate::mesh_gen::{
     ColorField, DiagramRibbon, LegendRange, ViewportDisplayOptions, build_scene_geometry,
     colormap_diverging, colormap_scientific,
@@ -54,7 +54,8 @@ pub struct Beam3dApp {
 
     pub tool: EditorTool,
     pub beam_draw_start: Option<usize>,
-    pub workplane_z: f64,
+    pub workplane_kind: WorkplaneKind,
+    pub workplane_offset: f64,
     pub snap_grid: f64,
     pub extrude_dz: f64,
     pub tutorial: TutorialState,
@@ -120,7 +121,8 @@ impl Beam3dApp {
             subdivide_count: 4,
             tool: EditorTool::Select,
             beam_draw_start: None,
-            workplane_z: 0.0,
+            workplane_kind: WorkplaneKind::XY,
+            workplane_offset: 0.0,
             snap_grid: 0.5,
             extrude_dz: 3.0,
             tutorial: TutorialState::default(),
@@ -151,6 +153,33 @@ impl Beam3dApp {
         app.run_solver();
         app.recompute_auto_disp_scale();
         app
+    }
+
+    /// Switches the active working plane (`XY`, `XZ`, `YZ`).
+    /// If an anchor node (`beam_draw_start` or `selected_node`) is active, automatically aligns
+    /// the new plane's offset to pass directly through that node so drawing columns/beams from it is immediate.
+    pub fn set_workplane_kind(&mut self, kind: WorkplaneKind) {
+        self.workplane_kind = kind;
+        if let Some(anchor_id) = self.beam_draw_start.or(self.selected_node) {
+            if let Some(n) = self.model.get_node(anchor_id) {
+                self.workplane_offset = n.position[kind.normal_index()];
+                self.status_msg = format!(
+                    "Working plane: {} aligned through Node N{} ({} = {:.2} m)",
+                    kind.full_label(),
+                    anchor_id,
+                    kind.normal_axis_name(),
+                    self.workplane_offset
+                );
+                return;
+            }
+        }
+        self.workplane_offset = 0.0;
+        self.status_msg = format!(
+            "Working plane: {} ({} = {:.2} m)",
+            kind.full_label(),
+            kind.normal_axis_name(),
+            self.workplane_offset
+        );
     }
 
     pub fn push_undo(&mut self) {
@@ -373,13 +402,36 @@ impl eframe::App for Beam3dApp {
                         self.tool = EditorTool::DrawBeam;
                     }
 
+                    ui.separator();
+                    ui.label(
+                        RichText::new("Plane:")
+                            .small()
+                            .color(Color32::from_gray(170)),
+                    );
+                    let mut chosen_plane = self.workplane_kind;
+                    for pk in WorkplaneKind::ALL {
+                        if ui
+                            .selectable_label(self.workplane_kind == pk, pk.short_label())
+                            .on_hover_text(format!("{} — press [P] to cycle", pk.full_label()))
+                            .clicked()
+                        {
+                            chosen_plane = pk;
+                        }
+                    }
+                    if chosen_plane != self.workplane_kind {
+                        self.set_workplane_kind(chosen_plane);
+                    }
+
+                    ui.label(
+                        RichText::new(format!("{}:", self.workplane_kind.normal_axis_name()))
+                            .small(),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.workplane_offset)
+                            .speed(0.25)
+                            .suffix("m"),
+                    );
                     if self.tool != EditorTool::Select {
-                        ui.label(RichText::new("Z:").small());
-                        ui.add(
-                            egui::DragValue::new(&mut self.workplane_z)
-                                .speed(0.25)
-                                .suffix("m"),
-                        );
                         ui.label(RichText::new("Snap:").small());
                         ui.add(
                             egui::DragValue::new(&mut self.snap_grid)
@@ -418,7 +470,7 @@ impl eframe::App for Beam3dApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new(
-                                "Orbit: Drag / Right-Drag  |  Pan: Middle / Shift+Drag  |  Zoom: Scroll  |  Fit: [F]",
+                                "Orbit: Drag/Right-Drag | Pan: Shift+Drag | Plane: [P] | Offset: [ / ] | Fit: [F]",
                             )
                             .small()
                             .color(Color32::from_gray(140)),
@@ -470,23 +522,37 @@ fn handle_global_shortcuts(app: &mut Beam3dApp, ctx: &egui::Context) {
     if ctx.egui_wants_keyboard_input() {
         return;
     }
+    let mut cycle_plane = false;
     ctx.input(|i| {
         if i.key_pressed(egui::Key::F) {
             let (min_p, max_p) = app.model.bounding_box();
             app.camera.fit_to_bounds(min_p, max_p);
         }
-        let z_step = if app.snap_grid > 1e-3 {
+        if i.key_pressed(egui::Key::P) {
+            cycle_plane = true;
+        }
+        let step = if app.snap_grid > 1e-3 {
             app.snap_grid
         } else {
             0.5
         };
         if i.key_pressed(egui::Key::CloseBracket) {
-            app.workplane_z += z_step;
-            app.status_msg = format!("Raised 3D Workplane Z to {:.2} m", app.workplane_z);
+            app.workplane_offset += step;
+            app.status_msg = format!(
+                "Working plane {}: {} = {:.2} m",
+                app.workplane_kind.short_label(),
+                app.workplane_kind.normal_axis_name(),
+                app.workplane_offset
+            );
         }
         if i.key_pressed(egui::Key::OpenBracket) {
-            app.workplane_z -= z_step;
-            app.status_msg = format!("Lowered 3D Workplane Z to {:.2} m", app.workplane_z);
+            app.workplane_offset -= step;
+            app.status_msg = format!(
+                "Working plane {}: {} = {:.2} m",
+                app.workplane_kind.short_label(),
+                app.workplane_kind.normal_axis_name(),
+                app.workplane_offset
+            );
         }
         if i.key_pressed(egui::Key::Escape) {
             if app.beam_draw_start.is_some() {
@@ -516,6 +582,10 @@ fn handle_global_shortcuts(app: &mut Beam3dApp, ctx: &egui::Context) {
             }
         }
     });
+    if cycle_plane {
+        let next = app.workplane_kind.next();
+        app.set_workplane_kind(next);
+    }
 }
 
 fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -582,17 +652,20 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
             }
         }
 
-        // 3. Workplane preview point for AddNode / DrawBeam tools
+        // 3. Workplane preview point for AddNode / DrawBeam tools (supports XY, XZ, and YZ planes!)
         if app.tool != EditorTool::Select {
             if let Some(nid) = app.hovered_node {
                 preview_point = app.model.get_node(nid).map(|n| n.position);
-            } else if let Some(mut hit) =
-                app.camera
-                    .intersect_horizontal_plane(cursor, rect, app.workplane_z)
-            {
+            } else if let Some(mut hit) = app.camera.intersect_workplane(
+                cursor,
+                rect,
+                app.workplane_kind,
+                app.workplane_offset,
+            ) {
                 if app.snap_grid > 1e-4 {
-                    hit[0] = (hit[0] / app.snap_grid).round() * app.snap_grid;
-                    hit[1] = (hit[1] / app.snap_grid).round() * app.snap_grid;
+                    let (ia, ib) = app.workplane_kind.in_plane_indices();
+                    hit[ia] = (hit[ia] / app.snap_grid).round() * app.snap_grid;
+                    hit[ib] = (hit[ib] / app.snap_grid).round() * app.snap_grid;
                 }
                 preview_point = Some(hit);
             }
@@ -651,15 +724,26 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
                                 app.selected_element = Some(eid);
                                 app.selected_node = None;
                                 app.mark_model_changed();
-                                app.status_msg =
-                                    format!("Created Beam B{eid} (N{start_nid} → N{nid}). Right-click or Esc to end chain.");
+                                app.status_msg = format!(
+                                    "Created Beam B{eid} (N{start_nid} → N{nid}). Press [P] to switch plane (XY/XZ/YZ) or Esc to end chain."
+                                );
                             }
                             app.beam_draw_start = Some(nid);
+                            if let Some(n) = app.model.get_node(nid) {
+                                app.workplane_offset =
+                                    n.position[app.workplane_kind.normal_index()];
+                            }
                         }
                     } else {
                         app.beam_draw_start = Some(nid);
+                        if let Some(n) = app.model.get_node(nid) {
+                            app.workplane_offset = n.position[app.workplane_kind.normal_index()];
+                        }
                         app.status_msg = format!(
-                            "Start Node N{nid} selected — click another node or grid point to place beam."
+                            "Start Node N{nid} selected ({} plane aligned at {} = {:.2} m) — click next point or press [P] to switch plane.",
+                            app.workplane_kind.short_label(),
+                            app.workplane_kind.normal_axis_name(),
+                            app.workplane_offset
                         );
                     }
                 }
@@ -676,7 +760,8 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
 
     let disp_opts = ViewportDisplayOptions {
         show_grid: app.show_grid,
-        workplane_z: app.workplane_z,
+        workplane_kind: app.workplane_kind,
+        workplane_offset: app.workplane_offset,
         show_extruded: app.show_extruded,
         profile_scale: app.profile_scale,
         show_deformed: app.show_deformed,
@@ -835,12 +920,15 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
                     }
                     if ui.small_button("Front X-Z").clicked() {
                         app.camera.set_preset_front_xz();
+                        app.set_workplane_kind(WorkplaneKind::XZ);
                     }
                     if ui.small_button("Side Y-Z").clicked() {
                         app.camera.set_preset_side_yz();
+                        app.set_workplane_kind(WorkplaneKind::YZ);
                     }
                     if ui.small_button("Top X-Y").clicked() {
                         app.camera.set_preset_top_xy();
+                        app.set_workplane_kind(WorkplaneKind::XY);
                     }
                 });
             });
@@ -848,29 +936,34 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
 
     // Top-Right 3D Drawing HUD when AddNode or DrawBeam tool is active
     if app.tool != EditorTool::Select {
-        let hud_w = 345.0;
+        let hud_w = 365.0;
         let hud_rect = Rect::from_min_size(
             egui::pos2(rect.right() - hud_w - 10.0, rect.top() + 10.0),
-            egui::vec2(hud_w, 64.0),
+            egui::vec2(hud_w, 88.0),
         );
         ui.scope_builder(egui::UiBuilder::new().max_rect(hud_rect), |ui| {
             egui::Frame::NONE
-                .fill(Color32::from_rgba_unmultiplied(18, 28, 42, 228))
+                .fill(Color32::from_rgba_unmultiplied(18, 28, 42, 232))
                 .corner_radius(CornerRadius::same(6))
                 .inner_margin(egui::Margin::symmetric(8, 5))
                 .stroke(Stroke::new(1.0, Color32::from_rgb(70, 145, 225)))
                 .show(ui, |ui| {
                     let mode_name = match app.tool {
-                        EditorTool::AddNode => "⊕ ADD NODE MODE",
-                        EditorTool::DrawBeam => "📏 DRAW BEAM MODE",
+                        EditorTool::AddNode => "⊕ ADD NODE",
+                        EditorTool::DrawBeam => "📏 DRAW BEAM",
                         EditorTool::Select => "",
                     };
+                    let axis_name = app.workplane_kind.normal_axis_name();
                     let coord_str = if let Some(nid) = app.hovered_node {
                         format!("Snap → Node N{nid}")
                     } else if let Some(pt) = preview_point {
                         format!("XYZ: ({:.2}, {:.2}, {:.2}) m", pt[0], pt[1], pt[2])
                     } else {
-                        format!("Workplane Z = {:.2} m", app.workplane_z)
+                        format!(
+                            "Plane {} ({axis_name} = {:.2} m) — orbit slightly if edge-on",
+                            app.workplane_kind.short_label(),
+                            app.workplane_offset
+                        )
                     };
                     ui.horizontal(|ui| {
                         ui.label(
@@ -887,23 +980,41 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
                                 .color(Color32::from_rgb(225, 238, 255)),
                         );
                     });
+
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Workplane Z:").small());
-                        for z_preset in [0.0, 3.0, 6.0] {
-                            let active = (app.workplane_z - z_preset).abs() < 1e-3;
+                        ui.label(RichText::new("Plane [P]:").small());
+                        let mut next_pk = app.workplane_kind;
+                        for (pk, lbl) in [
+                            (WorkplaneKind::XY, "XY Floor"),
+                            (WorkplaneKind::XZ, "XZ Vert"),
+                            (WorkplaneKind::YZ, "YZ Vert"),
+                        ] {
+                            if ui.selectable_label(app.workplane_kind == pk, lbl).clicked() {
+                                next_pk = pk;
+                            }
+                        }
+                        if next_pk != app.workplane_kind {
+                            app.set_workplane_kind(next_pk);
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("Offset {axis_name}:")).small());
+                        for preset in [0.0, 3.0, 6.0] {
+                            let active = (app.workplane_offset - preset).abs() < 1e-3;
                             if ui
-                                .selectable_label(active, format!("{z_preset:.0}m"))
+                                .selectable_label(active, format!("{preset:.0}m"))
                                 .clicked()
                             {
-                                app.workplane_z = z_preset;
+                                app.workplane_offset = preset;
                             }
                         }
                         let step = app.snap_grid.max(0.5);
-                        if ui.small_button("-Z [").clicked() {
-                            app.workplane_z -= step;
+                        if ui.small_button(format!("-{axis_name} [")).clicked() {
+                            app.workplane_offset -= step;
                         }
-                        if ui.small_button("+Z ]").clicked() {
-                            app.workplane_z += step;
+                        if ui.small_button(format!("+{axis_name} ]")).clicked() {
+                            app.workplane_offset += step;
                         }
                         if app.beam_draw_start.is_some() && ui.small_button("End Chain").clicked() {
                             app.beam_draw_start = None;

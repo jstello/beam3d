@@ -1,3 +1,4 @@
+use crate::camera::WorkplaneKind;
 use crate::renderer::{LineVertex, MeshVertex, SceneGeometry};
 use beam3d_core::{
     ElementFrame, LoadCoordSystem, Solution, StationSample, StructuralModel, SupportPreset,
@@ -99,7 +100,8 @@ impl DiagramRibbon {
 
 pub struct ViewportDisplayOptions {
     pub show_grid: bool,
-    pub workplane_z: f64,
+    pub workplane_kind: WorkplaneKind,
+    pub workplane_offset: f64,
     pub show_extruded: bool,
     pub profile_scale: f32,
     pub show_deformed: bool,
@@ -202,7 +204,12 @@ pub fn build_scene_geometry(
     let glyph_size = (char_len * 0.032).clamp(0.12, 1.2);
 
     if opts.show_grid {
-        build_ground_grid(model, opts.workplane_z as f32, out);
+        build_workplane_grid(
+            model,
+            opts.workplane_kind,
+            opts.workplane_offset as f32,
+            out,
+        );
     }
 
     let eff_disp_scale = if opts.show_deformed && solution.is_some() {
@@ -844,31 +851,153 @@ fn build_element_diagram_ribbon(
     push_line(&mut out.lines, centers[last].into(), tip_pts[last].into(), end_c);
 }
 
-fn build_ground_grid(model: &StructuralModel, z_plane: f32, out: &mut SceneGeometry) {
+fn build_workplane_grid(
+    model: &StructuralModel,
+    kind: WorkplaneKind,
+    plane_offset: f32,
+    out: &mut SceneGeometry,
+) {
     let (min_p, max_p) = model.bounding_box();
-    let cx = (0.5 * (min_p[0] + max_p[0]) as f32).round();
-    let cy = (0.5 * (min_p[1] + max_p[1]) as f32).round();
-    let span = ((max_p[0] - min_p[0]).max(max_p[1] - min_p[1]) as f32 * 0.85)
+    let cx = if min_p[0].is_finite() {
+        (0.5 * (min_p[0] + max_p[0]) as f32).round()
+    } else {
+        0.0
+    };
+    let cy = if min_p[1].is_finite() {
+        (0.5 * (min_p[1] + max_p[1]) as f32).round()
+    } else {
+        0.0
+    };
+    let max_z = if max_p[2].is_finite() {
+        (max_p[2] as f32).max(8.0) + 4.0
+    } else {
+        10.0
+    };
+    let span = ((max_p[0] - min_p[0])
+        .max(max_p[1] - min_p[1])
+        .max(max_p[2] - min_p[2]) as f32
+        * 0.85)
         .clamp(8.0, 60.0)
         .ceil();
     let step = if span > 30.0 { 2.0 } else { 1.0 };
     let half_steps = (span / step).ceil() as i32;
     let ext = half_steps as f32 * step;
 
-    for i in -half_steps..=half_steps {
-        let offset = i as f32 * step;
-        let is_major = i % 5 == 0;
-        let col = if is_major {
-            [0.24, 0.29, 0.37, 0.65]
-        } else {
-            [0.16, 0.20, 0.26, 0.42]
-        };
+    // When a vertical plane (XZ or YZ) is active, keep a subtle Z=0 ground reference grid
+    // so floor orientation in 3D space stays crystal-clear.
+    if kind != WorkplaneKind::XY {
+        for i in (-half_steps..=half_steps).step_by(2) {
+            let off = i as f32 * step;
+            let faint = [0.16, 0.19, 0.24, 0.24];
+            push_line(&mut out.lines, [cx - ext, cy + off, 0.0], [cx + ext, cy + off, 0.0], faint);
+            push_line(&mut out.lines, [cx + off, cy - ext, 0.0], [cx + off, cy + ext, 0.0], faint);
+        }
+    }
 
-        let y = cy + offset;
-        push_line(&mut out.lines, [cx - ext, y, z_plane], [cx + ext, y, z_plane], col);
+    match kind {
+        WorkplaneKind::XY => {
+            for i in -half_steps..=half_steps {
+                let off = i as f32 * step;
+                let is_major = i % 5 == 0;
+                let col = if is_major {
+                    [0.24, 0.30, 0.39, 0.68]
+                } else {
+                    [0.16, 0.20, 0.27, 0.44]
+                };
+                let y = cy + off;
+                push_line(
+                    &mut out.lines,
+                    [cx - ext, y, plane_offset],
+                    [cx + ext, y, plane_offset],
+                    col,
+                );
+                let x = cx + off;
+                push_line(
+                    &mut out.lines,
+                    [x, cy - ext, plane_offset],
+                    [x, cy + ext, plane_offset],
+                    col,
+                );
+            }
+        }
+        WorkplaneKind::XZ => {
+            let z_steps_min = -2i32;
+            let z_steps_max = (max_z / step).ceil() as i32;
+            let z_min = z_steps_min as f32 * step;
+            let z_max = z_steps_max as f32 * step;
 
-        let x = cx + offset;
-        push_line(&mut out.lines, [x, cy - ext, z_plane], [x, cy + ext, z_plane], col);
+            // Vertical lines along Z at each X
+            for i in -half_steps..=half_steps {
+                let x = cx + i as f32 * step;
+                let col = if i % 5 == 0 {
+                    [0.22, 0.44, 0.72, 0.72]
+                } else {
+                    [0.16, 0.30, 0.48, 0.44]
+                };
+                push_line(
+                    &mut out.lines,
+                    [x, plane_offset, z_min],
+                    [x, plane_offset, z_max],
+                    col,
+                );
+            }
+            // Horizontal elevation lines at each Z
+            for iz in z_steps_min..=z_steps_max {
+                let z = iz as f32 * step;
+                let col = if iz == 0 {
+                    [0.38, 0.72, 1.0, 0.92]
+                } else if iz % 5 == 0 {
+                    [0.22, 0.44, 0.72, 0.72]
+                } else {
+                    [0.16, 0.30, 0.48, 0.44]
+                };
+                push_line(
+                    &mut out.lines,
+                    [cx - ext, plane_offset, z],
+                    [cx + ext, plane_offset, z],
+                    col,
+                );
+            }
+        }
+        WorkplaneKind::YZ => {
+            let z_steps_min = -2i32;
+            let z_steps_max = (max_z / step).ceil() as i32;
+            let z_min = z_steps_min as f32 * step;
+            let z_max = z_steps_max as f32 * step;
+
+            // Vertical lines along Z at each Y
+            for i in -half_steps..=half_steps {
+                let y = cy + i as f32 * step;
+                let col = if i % 5 == 0 {
+                    [0.20, 0.62, 0.48, 0.72]
+                } else {
+                    [0.15, 0.40, 0.32, 0.44]
+                };
+                push_line(
+                    &mut out.lines,
+                    [plane_offset, y, z_min],
+                    [plane_offset, y, z_max],
+                    col,
+                );
+            }
+            // Horizontal elevation lines at each Z
+            for iz in z_steps_min..=z_steps_max {
+                let z = iz as f32 * step;
+                let col = if iz == 0 {
+                    [0.34, 0.92, 0.68, 0.92]
+                } else if iz % 5 == 0 {
+                    [0.20, 0.62, 0.48, 0.72]
+                } else {
+                    [0.15, 0.40, 0.32, 0.44]
+                };
+                push_line(
+                    &mut out.lines,
+                    [plane_offset, cy - ext, z],
+                    [plane_offset, cy + ext, z],
+                    col,
+                );
+            }
+        }
     }
 
     // World origin coordinate axes (+X Red, +Y Green, +Z Blue)

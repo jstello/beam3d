@@ -1,6 +1,68 @@
 use eframe::egui;
 use nalgebra::{Matrix4, Point3, Vector3, Vector4};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkplaneKind {
+    /// Horizontal floor plane (`Z = offset`).
+    XY,
+    /// Vertical front elevation plane (`Y = offset`).
+    XZ,
+    /// Vertical side elevation plane (`X = offset`).
+    YZ,
+}
+
+impl WorkplaneKind {
+    pub const ALL: [WorkplaneKind; 3] = [WorkplaneKind::XY, WorkplaneKind::XZ, WorkplaneKind::YZ];
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            WorkplaneKind::XY => "XY",
+            WorkplaneKind::XZ => "XZ",
+            WorkplaneKind::YZ => "YZ",
+        }
+    }
+
+    pub fn full_label(self) -> &'static str {
+        match self {
+            WorkplaneKind::XY => "XY (Floor)",
+            WorkplaneKind::XZ => "XZ (Vertical Front)",
+            WorkplaneKind::YZ => "YZ (Vertical Side)",
+        }
+    }
+
+    pub fn normal_axis_name(self) -> &'static str {
+        match self {
+            WorkplaneKind::XY => "Z",
+            WorkplaneKind::XZ => "Y",
+            WorkplaneKind::YZ => "X",
+        }
+    }
+
+    pub fn normal_index(self) -> usize {
+        match self {
+            WorkplaneKind::XY => 2,
+            WorkplaneKind::XZ => 1,
+            WorkplaneKind::YZ => 0,
+        }
+    }
+
+    pub fn in_plane_indices(self) -> (usize, usize) {
+        match self {
+            WorkplaneKind::XY => (0, 1),
+            WorkplaneKind::XZ => (0, 2),
+            WorkplaneKind::YZ => (1, 2),
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            WorkplaneKind::XY => WorkplaneKind::XZ,
+            WorkplaneKind::XZ => WorkplaneKind::YZ,
+            WorkplaneKind::YZ => WorkplaneKind::XY,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OrbitCamera {
     pub target: Vector3<f32>,
@@ -167,23 +229,28 @@ impl OrbitCamera {
         )
     }
 
-    /// Intersects a cursor ray with the horizontal plane `Z = plane_z`.
-    pub fn intersect_horizontal_plane(
+    /// Intersects a cursor ray with an `XY`, `XZ`, or `YZ` construction plane at `coord[normal] = offset`.
+    pub fn intersect_workplane(
         &self,
         cursor: egui::Pos2,
         rect: egui::Rect,
-        plane_z: f64,
+        kind: WorkplaneKind,
+        offset: f64,
     ) -> Option<[f64; 3]> {
         let (orig, dir) = self.screen_ray(cursor, rect);
-        if dir.z.abs() < 1e-5 {
+        let n_idx = kind.normal_index();
+        let denom = dir[n_idx];
+        if denom.abs() < 1e-4 {
             return None;
         }
-        let t = (plane_z - orig.z) / dir.z;
+        let t = (offset - orig[n_idx]) / denom;
         if t <= 0.0 || t > 2000.0 {
             return None;
         }
         let hit = orig + dir * t;
-        Some([hit.x, hit.y, plane_z])
+        let mut out = [hit.x, hit.y, hit.z];
+        out[n_idx] = offset;
+        Some(out)
     }
 }
 
