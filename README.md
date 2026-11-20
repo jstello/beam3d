@@ -1,21 +1,24 @@
 # Beam3D — 3D Structural Finite Element Solver & Native Rust UI
 
-A pure-Rust 3D structural finite element solver (beams + 2D shells) and native hardware-accelerated desktop application built with `egui` + `wgpu`.
+A pure-Rust 3D structural finite element solver (beams + 2D shells, linear & nonlinear large deformations, modal & transient dynamics) and native hardware-accelerated desktop application built with `egui` + `wgpu`.
 
 ## Features & Workspace Structure
 
-- **`crates/beam3d-core`**: Standalone 3D linear static FEA library (written from scratch in Rust)
+- **`crates/beam3d-core`**: Standalone 3D FEA library (written from scratch in Rust)
   - **3D Space-Frame Beams (`element.rs`):** 2-node, 12-DOF **Timoshenko** (shear-deformable) and **Euler–Bernoulli** beam elements, arbitrary cross-section roll angle $\gamma$, and exact element-level **static condensation** for member end-releases (hinges).
   - **2D Shell / Surface Elements (`shell.rs`):** Flat 3D **Mindlin–Reissner + Plane-Stress** shells — 4-node quads (`Quad4`) with 2×2 Gauss bending/membrane integration + 1×1 Selective Reduced Integration (SRI) to prevent thin-plate shear locking, and 3-node triangles (`Tri3`) with invariant drilling-DOF stabilization. Fully coupled with 3D beams in the same 6-DOF/node global stiffness matrix.
+  - **Large Deformations / Geometric Nonlinearity (`nonlinear.rs`):** Incremental Newton–Raphson corotational 3D beam & EICR shell solver with adaptive step halving, $SO(3)$ rotation updates, P-Delta amplification, membrane stress stiffening, and deformed-frame internal force recovery.
+  - **Structural Dynamics (`dynamics.rs`):** Consistent & lumped mass matrices (plus nodal lumped `added_mass`), **Modal Analysis** (natural frequencies, periods, and mass-normalized 3D mode shapes via dense & subspace eigensolvers), and **Linear & Nonlinear Transient Time-History** integration (implicit Newmark-$\beta$ / HHT-$\alpha$, Rayleigh damping, and `Step`, `Ramp`, `Impulse`, `HalfSinePulse`, `Harmonic`, `BaseSine` seismic, and `FreeVibration` excitations).
   - **Cross-Section Library (`section.rs`):** Parametric **I/H Wide-Flange**, **Hollow Rectangular Box (HSS)**, **Circular Pipe/Tube**, **Solid Rectangle**, **Solid Circle**, and **Custom** section properties ($A, I_y, I_z, J, A_{sy}, A_{sz}$).
   - **Loads & Boundary Conditions:** Nodal forces & moments, prescribed support displacements/rotations, self-weight gravity, uniform/trapezoidal 1D distributed beam loads (3-point Gauss–Legendre exact integration), and 2D distributed surface pressures (`Global` or `Local Normal`) on shells.
   - **Sparse Linear Algebra (`solver.rs`):** Global stiffness assembled in CSC format and solved via **`faer`** supernodal sparse Cholesky ($LL^T$) with sparse $LU$ fallback, residual verification, reaction recovery, and exact interior station force/deflection/stress recovery. Local element transformations and condensation use **`nalgebra`**.
-  - **Analytical Verification Suite (`tests.rs`):** Automated tests verifying Euler–Bernoulli & Timoshenko cantilevers, simply supported beams, propped-cantilever hinge condensation, Castigliano 3D coupled bending/torsion, `Quad4`/`Tri3` membrane patch tests, and Navier's simply supported square plate benchmark.
+  - **Analytical Verification Suite (`tests.rs`):** 21 automated core tests verifying Euler–Bernoulli & Timoshenko cantilevers, propped-cantilever hinges, Castigliano 3D coupled bending/torsion, `Quad4`/`Tri3` membrane patches, Navier's simply supported plate, 90° circular elastica, P-Delta column amplification, shell stress stiffening, analytical cantilever/plate modal frequencies, DAF = 2.0 step-load energy conservation, harmonic resonance, and nonlinear dynamics.
 - **`crates/beam3d-ui`**: Native Desktop CAD/CAE Interface (`eframe` + custom 4x MSAA `wgpu` 3D pipeline)
-  - Extruded 3D beam profiles that bend and twist along the solved deformed shape, alongside smooth 3D deformed shell surfaces.
+  - Extruded 3D beam profiles with $SO(3)$ frame interpolation (undistorted through 90°+ large rotations) alongside smooth 3D deformed shell surfaces.
+  - Switchable **`Linear Static`**, **`Nonlinear Static (Large Deform.)`**, **`Modal`** (mode selector + harmonic animation), and **`Dynamic (Time History)`** (interactive playback scrubber + time-history & load-deflection `egui_plot` charts).
   - Scientific contour colormaps (Displacement, Von Mises Stress, Normal Stress, Yield Utilization %, $M_y, M_z, V_z, V_y, N, T$) and 3D shaded internal force/moment ribbons.
   - Interactive 3D sketching across switchable **`XY` / `XZ` / `YZ`** working planes (`Select`, `Add Node`, `Draw Beam`, `Draw Shell` with auto-meshing `Nx × Ny`, and one-click bulk 2D surface loads).
-  - 7 built-in templates (including *3D Concrete Floor Slab on Steel Beams*, *2D Simply Supported Square Plate*, *3D Braced Multi-Story Steel Frame*, and *3D Tied-Arch Pedestrian Bridge*), Undo/Redo, live 2D cross-section preview, 2D `egui_plot` member diagrams, reaction/displacement tables, interactive in-app tutorials, and JSON save/open.
+  - 8 built-in templates (including *Flexible Cantilever 90° Elastica*, *3D Concrete Floor Slab on Steel Beams*, *2D Simply Supported Square Plate*, *3D Braced Multi-Story Steel Frame*, and *3D Tied-Arch Pedestrian Bridge*), Undo/Redo, live 2D cross-section preview, 2D `egui_plot` member diagrams, reaction/displacement tables, interactive in-app tutorials, and JSON save/open.
 
 ## Quick Start
 

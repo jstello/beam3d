@@ -7,7 +7,10 @@ use crate::panels::{draw_bottom_panel, draw_left_panel, draw_right_panel};
 use crate::renderer::{CameraUniform, SceneGeometry, ViewportRenderer};
 use crate::tutorials::{TutorialState, TutorialTrack, draw_tutorial_window, start_tutorial};
 use beam3d_core::{
-    LoadCoordSystem, Solution, StructuralModel, TemplateKind, solve_linear_static,
+    DynamicConfig, DynamicSolution, LoadCoordSystem, ModalConfig, ModalSolution,
+    NonlinearSolution, NonlinearStaticConfig, RayleighDamping, Solution, StructuralModel,
+    TemplateKind, TimeHistoryExcitation, solve_dynamic_with_config, solve_linear_static,
+    solve_modal_with_config, solve_nonlinear_static_with_config,
 };
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, RichText, Stroke};
 
@@ -31,6 +34,42 @@ pub enum BottomTab {
     MemberDiagrams,
     ReactionsTable,
     DisplacementsTable,
+    AnalysisCharts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisMode {
+    LinearStatic,
+    NonlinearStatic,
+    Modal,
+    Dynamic,
+}
+
+impl AnalysisMode {
+    pub const ALL: [AnalysisMode; 4] = [
+        AnalysisMode::LinearStatic,
+        AnalysisMode::NonlinearStatic,
+        AnalysisMode::Modal,
+        AnalysisMode::Dynamic,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AnalysisMode::LinearStatic => "Linear Static",
+            AnalysisMode::NonlinearStatic => "Nonlinear Static (Large Deform.)",
+            AnalysisMode::Modal => "Modal (Natural Frequencies)",
+            AnalysisMode::Dynamic => "Dynamic Time-History",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            AnalysisMode::LinearStatic => "Linear Static",
+            AnalysisMode::NonlinearStatic => "Large Deform.",
+            AnalysisMode::Modal => "Modal",
+            AnalysisMode::Dynamic => "Dynamic",
+        }
+    }
 }
 
 pub struct Beam3dApp {
@@ -42,6 +81,25 @@ pub struct Beam3dApp {
     pub solver_error: Option<String>,
     pub auto_solve: bool,
     dirty_solve: bool,
+
+    pub analysis_mode: AnalysisMode,
+    pub nl_config: NonlinearStaticConfig,
+    pub nl_solution: Option<NonlinearSolution>,
+    pub modal_config: ModalConfig,
+    pub modal_solution: Option<ModalSolution>,
+    pub selected_mode_idx: usize,
+    pub dynamic_config: DynamicConfig,
+    pub dynamic_solution: Option<DynamicSolution>,
+    pub dynamic_frame_idx: usize,
+    pub dynamic_playing: bool,
+    dynamic_playback_time: f64,
+    pub dynamic_speed: f64,
+    pub damping_ratio_pct: f64,
+    pub excitation_kind: usize,
+    pub exc_duration_s: f64,
+    pub exc_freq_hz: f64,
+    pub exc_base_amp_g: f64,
+    pub exc_base_dir: [f64; 3],
 
     pub selected_node: Option<usize>,
     pub selected_element: Option<usize>,
@@ -123,6 +181,24 @@ impl Beam3dApp {
             solver_error: None,
             auto_solve: true,
             dirty_solve: true,
+            analysis_mode: AnalysisMode::LinearStatic,
+            nl_config: NonlinearStaticConfig::default(),
+            nl_solution: None,
+            modal_config: ModalConfig::default(),
+            modal_solution: None,
+            selected_mode_idx: 0,
+            dynamic_config: DynamicConfig::default(),
+            dynamic_solution: None,
+            dynamic_frame_idx: 0,
+            dynamic_playing: false,
+            dynamic_playback_time: 0.0,
+            dynamic_speed: 1.0,
+            damping_ratio_pct: 2.0,
+            excitation_kind: 0,
+            exc_duration_s: 0.25,
+            exc_freq_hz: 2.0,
+            exc_base_amp_g: 0.3,
+            exc_base_dir: [1.0, 0.0, 0.0],
             selected_node: None,
             selected_element: Some(1),
             selected_shell: None,
@@ -259,34 +335,221 @@ impl Beam3dApp {
         self.status_msg = status.into();
     }
 
+    pub fn sync_dynamic_config(&mut self) {
+        self.dynamic_config.damping = if self.damping_ratio_pct <= 1e-6 {
+            RayleighDamping::None
+        } else {
+            RayleighDamping::ModalRatio {
+                zeta: (self.damping_ratio_pct * 0.01).clamp(0.0, 0.95),
+            }
+        };
+        self.dynamic_config.excitation = match self.excitation_kind {
+            0 => TimeHistoryExcitation::Step,
+            1 => TimeHistoryExcitation::Impulse {
+                duration_s: self.exc_duration_s.max(0.005),
+            },
+            2 => TimeHistoryExcitation::HalfSinePulse {
+                duration_s: self.exc_duration_s.max(0.005),
+            },
+            3 => TimeHistoryExcitation::Harmonic {
+                frequency_hz: self.exc_freq_hz.max(0.05),
+            },
+            4 => TimeHistoryExcitation::Ramp {
+                rise_time_s: self.exc_duration_s.max(0.005),
+            },
+            5 => TimeHistoryExcitation::FreeVibration,
+            _ => TimeHistoryExcitation::BaseSine {
+                direction: self.exc_base_dir,
+                amplitude_g: self.exc_base_amp_g,
+                frequency_hz: self.exc_freq_hz.max(0.05),
+                duration_s: self.exc_duration_s.max(0.05),
+            },
+        };
+    }
+
+    pub fn select_mode(&mut self, idx: usize) {
+        if let Some(msol) = &self.modal_solution {
+            if !msol.modes.is_empty() {
+                let clamped = idx.min(msol.modes.len() - 1);
+                self.selected_mode_idx = clamped;
+                self.solution = Some(msol.modes[clamped].solution.clone());
+                self.recompute_auto_disp_scale();
+            }
+        }
+    }
+
+    pub fn set_dynamic_frame(&mut self, idx: usize) {
+        if let Some(dsol) = &self.dynamic_solution {
+            if !dsol.frames.is_empty() {
+                let clamped = idx.min(dsol.frames.len() - 1);
+                self.dynamic_frame_idx = clamped;
+                self.dynamic_playback_time = dsol.frames[clamped].time_s;
+                self.solution = Some(dsol.frames[clamped].solution.clone());
+            }
+        }
+    }
+
     pub fn run_solver(&mut self) {
         self.dirty_solve = false;
-        match solve_linear_static(&self.model) {
-            Ok(sol) => {
-                self.status_msg = format!(
-                    "Solved {} DOFs in {:.2} ms — Max |u| = {:.3} mm, Max σ = {:.1} MPa",
-                    sol.summary.free_dofs,
-                    sol.summary.solve_time_ms,
-                    sol.summary.max_displacement_m * 1e3,
-                    sol.summary.max_stress_pa * 1e-6
-                );
-                self.solution = Some(sol);
-                self.solver_error = None;
+        self.dynamic_playing = false;
+
+        match self.analysis_mode {
+            AnalysisMode::LinearStatic => {
+                match solve_linear_static(&self.model) {
+                    Ok(sol) => {
+                        self.status_msg = format!(
+                            "Linear Static: {} DOFs in {:.2} ms — Max |u| = {:.3} mm, Max σ = {:.1} MPa",
+                            sol.summary.free_dofs,
+                            sol.summary.solve_time_ms,
+                            sol.summary.max_displacement_m * 1e3,
+                            sol.summary.max_stress_pa * 1e-6
+                        );
+                        self.solution = Some(sol);
+                        self.solver_error = None;
+                    }
+                    Err(e) => {
+                        self.solution = None;
+                        self.solver_error = Some(e.to_string());
+                        self.status_msg = format!("Solver warning: {e}");
+                    }
+                }
             }
-            Err(e) => {
-                self.solution = None;
-                self.solver_error = Some(e.to_string());
-                self.status_msg = format!("Solver warning: {e}");
+            AnalysisMode::NonlinearStatic => {
+                match solve_nonlinear_static_with_config(&self.model, &self.nl_config) {
+                    Ok(nl) => {
+                        self.status_msg = format!(
+                            "Nonlinear Static (Large Deform.): {} steps ({} iters) in {:.1} ms — Max |u| = {:.3} mm, Max σ = {:.1} MPa",
+                            nl.load_steps.len(),
+                            nl.total_iterations,
+                            nl.solution.summary.solve_time_ms,
+                            nl.solution.summary.max_displacement_m * 1e3,
+                            nl.solution.summary.max_stress_pa * 1e-6
+                        );
+                        let max_u = nl.solution.summary.max_displacement_m;
+                        self.solution = Some(nl.solution.clone());
+                        self.nl_solution = Some(nl);
+                        self.solver_error = None;
+                        // Automatically use true 1:1 physical scale when deformations are genuinely large
+                        if max_u > 0.03 * self.model.characteristic_length() {
+                            self.disp_scale = 1.0;
+                        }
+                    }
+                    Err(e) => {
+                        self.solution = None;
+                        self.nl_solution = None;
+                        self.solver_error = Some(e.to_string());
+                        self.status_msg = format!("Nonlinear solver error: {e}");
+                    }
+                }
+            }
+            AnalysisMode::Modal => {
+                match solve_modal_with_config(&self.model, &self.modal_config) {
+                    Ok(msol) => {
+                        let f1 = msol
+                            .modes
+                            .first()
+                            .map(|m| m.frequency_hz)
+                            .unwrap_or(0.0);
+                        self.status_msg = format!(
+                            "Modal: {} modes in {:.1} ms — f₁ = {:.3} Hz (T₁ = {:.3} s), Total Mass = {:.1} kg",
+                            msol.modes.len(),
+                            msol.solve_time_ms,
+                            f1,
+                            if f1 > 1e-9 { 1.0 / f1 } else { 0.0 },
+                            msol.total_mass_kg
+                        );
+                        let idx = self
+                            .selected_mode_idx
+                            .min(msol.modes.len().saturating_sub(1));
+                        self.selected_mode_idx = idx;
+                        self.solution = msol.modes.get(idx).map(|m| m.solution.clone());
+                        self.modal_solution = Some(msol);
+                        self.solver_error = None;
+                        self.show_deformed = true;
+                        self.animate_deformed = true;
+                        self.recompute_auto_disp_scale();
+                    }
+                    Err(e) => {
+                        self.solution = None;
+                        self.modal_solution = None;
+                        self.solver_error = Some(e.to_string());
+                        self.status_msg = format!("Modal solver error: {e}");
+                    }
+                }
+            }
+            AnalysisMode::Dynamic => {
+                self.sync_dynamic_config();
+                match solve_dynamic_with_config(&self.model, &self.dynamic_config) {
+                    Ok(dsol) => {
+                        self.status_msg = format!(
+                            "{} Dynamic: {} steps in {:.1} ms — Peak |u| = {:.3} mm @ t = {:.3} s, Peak σ = {:.1} MPa",
+                            if dsol.nonlinear { "Nonlinear" } else { "Linear" },
+                            dsol.time_steps,
+                            dsol.solve_time_ms,
+                            dsol.peak_displacement_m * 1e3,
+                            dsol.peak_displacement_time_s,
+                            dsol.peak_stress_pa * 1e-6
+                        );
+                        self.dynamic_frame_idx = 0;
+                        self.dynamic_playback_time = 0.0;
+                        let peak_u = dsol.peak_displacement_m;
+                        self.solution = dsol.frames.first().map(|f| f.solution.clone());
+                        self.dynamic_solution = Some(dsol);
+                        self.solver_error = None;
+                        self.show_deformed = true;
+                        self.animate_deformed = false;
+                        self.dynamic_playing = true;
+                        if peak_u > 0.03 * self.model.characteristic_length() {
+                            self.disp_scale = 1.0;
+                        } else if peak_u > 1e-9 {
+                            let target_visual = 0.085 * self.model.characteristic_length();
+                            self.disp_scale = (target_visual / peak_u).clamp(0.5, 2000.0);
+                        }
+                    }
+                    Err(e) => {
+                        self.solution = None;
+                        self.dynamic_solution = None;
+                        self.solver_error = Some(e.to_string());
+                        self.status_msg = format!("Dynamic solver error: {e}");
+                    }
+                }
             }
         }
     }
 
     pub fn recompute_auto_disp_scale(&mut self) {
-        if let Some(sol) = &self.solution {
-            let max_u = sol.summary.max_displacement_m;
-            if max_u > 1e-9 {
-                let target_visual = 0.075 * self.model.characteristic_length();
-                self.disp_scale = (target_visual / max_u).clamp(0.5, 2000.0);
+        let char_len = self.model.characteristic_length();
+        match self.analysis_mode {
+            AnalysisMode::NonlinearStatic => {
+                if let Some(sol) = &self.solution {
+                    let max_u = sol.summary.max_displacement_m;
+                    if max_u > 0.03 * char_len {
+                        self.disp_scale = 1.0;
+                    } else if max_u > 1e-9 {
+                        let target_visual = 0.075 * char_len;
+                        self.disp_scale = (target_visual / max_u).clamp(0.5, 2000.0);
+                    }
+                }
+            }
+            AnalysisMode::Dynamic => {
+                if let Some(dsol) = &self.dynamic_solution {
+                    let peak_u = dsol.peak_displacement_m;
+                    if peak_u > 0.03 * char_len {
+                        self.disp_scale = 1.0;
+                    } else if peak_u > 1e-9 {
+                        let target_visual = 0.085 * char_len;
+                        self.disp_scale = (target_visual / peak_u).clamp(0.5, 2000.0);
+                    }
+                }
+            }
+            AnalysisMode::LinearStatic | AnalysisMode::Modal => {
+                if let Some(sol) = &self.solution {
+                    let max_u = sol.summary.max_displacement_m;
+                    if max_u > 1e-9 {
+                        let target_visual = 0.075 * char_len;
+                        self.disp_scale = (target_visual / max_u).clamp(0.5, 2000.0);
+                    }
+                }
             }
         }
     }
@@ -335,9 +598,30 @@ impl eframe::App for Beam3dApp {
             self.run_solver();
         }
 
-        if self.animate_deformed && self.show_deformed {
+        if self.analysis_mode == AnalysisMode::Dynamic && self.dynamic_playing {
             let dt = ctx.input(|i| i.stable_dt) as f64;
-            self.anim_time += dt * 2.8;
+            if let Some(dsol) = &self.dynamic_solution {
+                if let Some(last_frame) = dsol.frames.last() {
+                    let dur = last_frame.time_s.max(1e-6);
+                    self.dynamic_playback_time += dt * self.dynamic_speed;
+                    if self.dynamic_playback_time > dur {
+                        self.dynamic_playback_time %= dur;
+                    }
+                    let target_t = self.dynamic_playback_time;
+                    let idx = dsol
+                        .frames
+                        .partition_point(|f| f.time_s < target_t)
+                        .min(dsol.frames.len() - 1);
+                    if idx != self.dynamic_frame_idx {
+                        self.dynamic_frame_idx = idx;
+                        self.solution = Some(dsol.frames[idx].solution.clone());
+                    }
+                    ctx.request_repaint();
+                }
+            }
+        } else if self.animate_deformed && self.show_deformed {
+            let dt = ctx.input(|i| i.stable_dt) as f64;
+            self.anim_time += dt * 3.2;
             ctx.request_repaint();
         }
 
@@ -420,6 +704,29 @@ impl eframe::App for Beam3dApp {
                         )
                         .fill(Color32::from_rgb(80, 215, 135));
                         if ui.add(solve_btn).clicked() {
+                            self.run_solver();
+                        }
+
+                        let mut next_mode = self.analysis_mode;
+                        egui::ComboBox::from_id_salt("analysis_mode_selector")
+                            .selected_text(format!("⚙ {}", self.analysis_mode.short_label()))
+                            .width(132.0)
+                            .show_ui(ui, |ui| {
+                                for m in AnalysisMode::ALL {
+                                    ui.selectable_value(&mut next_mode, m, m.label());
+                                }
+                            });
+                        if next_mode != self.analysis_mode {
+                            self.analysis_mode = next_mode;
+                            if matches!(
+                                next_mode,
+                                AnalysisMode::NonlinearStatic
+                                    | AnalysisMode::Modal
+                                    | AnalysisMode::Dynamic
+                            ) {
+                                self.bottom_tab = BottomTab::AnalysisCharts;
+                                self.show_bottom_panel = true;
+                            }
                             self.run_solver();
                         }
                     });
@@ -955,8 +1262,14 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
     }
 
     // Build 3D scene geometry & render via wgpu
-    let anim_factor = if app.animate_deformed {
-        0.5 + 0.5 * app.anim_time.sin()
+    let anim_factor = if app.analysis_mode == AnalysisMode::Dynamic {
+        1.0
+    } else if app.animate_deformed {
+        if app.analysis_mode == AnalysisMode::Modal {
+            app.anim_time.sin()
+        } else {
+            0.5 + 0.5 * app.anim_time.sin()
+        }
     } else {
         1.0
     };

@@ -47,6 +47,12 @@ pub enum SolverError {
     SingularSystem,
     #[error("Sparse matrix assembly failed: {0}")]
     SparseAssembly(String),
+    #[error("Nonlinear solver failed to converge at step {step} (relative residual = {residual:.3e}).")]
+    ConvergenceFailed { step: usize, residual: f64 },
+    #[error("Global mass matrix is singular or has zero/negative mass (check material densities).")]
+    SingularMassMatrix,
+    #[error("Invalid solver configuration: {0}")]
+    InvalidConfig(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

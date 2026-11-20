@@ -271,8 +271,49 @@ pub fn build_scene_geometry(
         let base_ex = Vector3::from(to_f32(frame.ex()));
         let base_ey = Vector3::from(to_f32(frame.ey()));
         let base_ez = Vector3::from(to_f32(frame.ez()));
+        let mut vis_ex = base_ex;
+        let mut vis_ey = base_ey;
+        let mut vis_ez = base_ez;
 
         if let Some(er) = elem_res {
+            // For nonlinear corotational solutions, er.ex/ey/ez is the deformed corotated frame.
+            // Interpolate smoothly from undeformed frame0 to er's corotated frame using SO(3) log/exp
+            // so extruded 3D cross-sections stay perpendicular to the deformed beam at 90°+ rotations!
+            let vis_r_mat = if eff_disp_scale.abs() > 1e-9 {
+                let q0 = frame.r_mat.transpose();
+                let q_def = Matrix3::from_columns(&[
+                    nalgebra::Vector3::from(er.ex),
+                    nalgebra::Vector3::from(er.ey),
+                    nalgebra::Vector3::from(er.ez),
+                ]);
+                let th_rel = beam3d_core::nonlinear::log_so3(&(q_def * q0.transpose()));
+                if th_rel.norm() > 1e-7 {
+                    let q_vis =
+                        beam3d_core::nonlinear::exp_so3(th_rel * eff_disp_scale.clamp(-2.0, 2.0))
+                            * q0;
+                    vis_ex = Vector3::new(
+                        q_vis[(0, 0)] as f32,
+                        q_vis[(1, 0)] as f32,
+                        q_vis[(2, 0)] as f32,
+                    );
+                    vis_ey = Vector3::new(
+                        q_vis[(0, 1)] as f32,
+                        q_vis[(1, 1)] as f32,
+                        q_vis[(2, 1)] as f32,
+                    );
+                    vis_ez = Vector3::new(
+                        q_vis[(0, 2)] as f32,
+                        q_vis[(1, 2)] as f32,
+                        q_vis[(2, 2)] as f32,
+                    );
+                    q_vis.transpose()
+                } else {
+                    frame.r_mat
+                }
+            } else {
+                frame.r_mat
+            };
+
             for st in &er.stations {
                 let p = Vector3::new(
                     (st.pos_undeformed[0] + eff_disp_scale * st.disp_global[0]) as f32,
@@ -281,9 +322,9 @@ pub fn build_scene_geometry(
                 );
                 let (ey_rot, ez_rot) = if eff_disp_scale.abs() > 1e-9 {
                     rotate_section_axes(
-                        &frame.r_mat,
-                        base_ey,
-                        base_ez,
+                        &vis_r_mat,
+                        vis_ey,
+                        vis_ez,
                         st.rot_local,
                         eff_disp_scale,
                     )
@@ -483,7 +524,7 @@ pub fn build_scene_geometry(
             push_line(
                 &mut out.lines,
                 mid_p.into(),
-                (mid_p + base_ex * triad_len).into(),
+                (mid_p + vis_ex * triad_len).into(),
                 [0.96, 0.26, 0.26, 1.0],
             );
             push_line(

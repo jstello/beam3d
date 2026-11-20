@@ -56,6 +56,9 @@ pub struct Node {
     /// Optional prescribed displacements/rotations `[m, m, m, rad, rad, rad]` applied on restrained DOFs.
     #[serde(default)]
     pub prescribed: [f64; 6],
+    /// Optional lumped translational point mass at this node in kg (used in modal & dynamic analysis).
+    #[serde(default)]
+    pub added_mass: f64,
 }
 
 impl Node {
@@ -66,6 +69,7 @@ impl Node {
             position,
             restraints: [false; 6],
             prescribed: [0.0; 6],
+            added_mass: 0.0,
         }
     }
 

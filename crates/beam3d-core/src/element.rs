@@ -170,6 +170,191 @@ pub fn uncondensed_local_stiffness(
     k
 }
 
+/// 12x12 local mass matrix for a 3D beam element (consistent Hermitian or HRZ lumped).
+/// Local DOF order: `[ux1, uy1, uz1, rx1, ry1, rz1, ux2, uy2, uz2, rx2, ry2, rz2]`.
+pub fn beam_local_mass_matrix(
+    density: f64,
+    props: &SectionProperties,
+    length: f64,
+    lumped: bool,
+) -> SMatrix<f64, 12, 12> {
+    let l = length;
+    let l2 = l * l;
+    let rho = density.max(0.0);
+    let m_tot = rho * props.area * l;
+    let ip = (props.iy + props.iz).max(1e-12);
+
+    let mut m = SMatrix::<f64, 12, 12>::zeros();
+    if m_tot <= 0.0 {
+        return m;
+    }
+
+    if lumped {
+        let half_m = 0.5 * m_tot;
+        // Translational mass
+        for &dof in &[0, 1, 2, 6, 7, 8] {
+            m[(dof, dof)] = half_m;
+        }
+        // Torsional rotary inertia
+        let rx_i = (0.5 * rho * ip * l).max(1e-12 * m_tot * l2);
+        m[(3, 3)] = rx_i;
+        m[(9, 9)] = rx_i;
+        // HRZ-lumped bending rotary inertia (m * L^2 / 78, guaranteed positive definite)
+        let r_bend = (m_tot * l2 / 78.0).max(0.5 * rho * props.iy.max(props.iz) * l);
+        for &dof in &[4, 5, 10, 11] {
+            m[(dof, dof)] = r_bend;
+        }
+        return m;
+    }
+
+    // Consistent mass matrix
+    // 1. Axial (ux1=0, ux2=6)
+    let ma = m_tot / 6.0;
+    m[(0, 0)] = 2.0 * ma;
+    m[(0, 6)] = ma;
+    m[(6, 0)] = ma;
+    m[(6, 6)] = 2.0 * ma;
+
+    // 2. Torsion (rx1=3, rx2=9)
+    let mt = (rho * ip * l / 6.0).max(1e-12 * m_tot * l2);
+    m[(3, 3)] = 2.0 * mt;
+    m[(3, 9)] = mt;
+    m[(9, 3)] = mt;
+    m[(9, 9)] = 2.0 * mt;
+
+    // 3. Bending in x-y plane (uy1=1, rz1=5, uy2=7, rz2=11)
+    let c = m_tot / 420.0;
+    m[(1, 1)] = 156.0 * c;
+    m[(1, 5)] = 22.0 * l * c;
+    m[(1, 7)] = 54.0 * c;
+    m[(1, 11)] = -13.0 * l * c;
+
+    m[(5, 1)] = 22.0 * l * c;
+    m[(5, 5)] = 4.0 * l2 * c;
+    m[(5, 7)] = 13.0 * l * c;
+    m[(5, 11)] = -3.0 * l2 * c;
+
+    m[(7, 1)] = 54.0 * c;
+    m[(7, 5)] = 13.0 * l * c;
+    m[(7, 7)] = 156.0 * c;
+    m[(7, 11)] = -22.0 * l * c;
+
+    m[(11, 1)] = -13.0 * l * c;
+    m[(11, 5)] = -3.0 * l2 * c;
+    m[(11, 7)] = -22.0 * l * c;
+    m[(11, 11)] = 4.0 * l2 * c;
+
+    // 4. Bending in x-z plane (uz1=2, ry1=4, uz2=8, ry2=10; theta_y = -dw/dx flips off-diagonal signs)
+    m[(2, 2)] = 156.0 * c;
+    m[(2, 4)] = -22.0 * l * c;
+    m[(2, 8)] = 54.0 * c;
+    m[(2, 10)] = 13.0 * l * c;
+
+    m[(4, 2)] = -22.0 * l * c;
+    m[(4, 4)] = 4.0 * l2 * c;
+    m[(4, 8)] = -13.0 * l * c;
+    m[(4, 10)] = -3.0 * l2 * c;
+
+    m[(8, 2)] = 54.0 * c;
+    m[(8, 4)] = -13.0 * l * c;
+    m[(8, 8)] = 156.0 * c;
+    m[(8, 10)] = 22.0 * l * c;
+
+    m[(10, 2)] = 13.0 * l * c;
+    m[(10, 4)] = -3.0 * l2 * c;
+    m[(10, 8)] = 22.0 * l * c;
+    m[(10, 10)] = 4.0 * l2 * c;
+
+    m
+}
+
+/// 12x12 local geometric stiffness matrix `K_G` for a 3D beam element under axial force `axial_n`
+/// (tension > 0, compression < 0) and local end shears `vy1` (= f_int[1]), `vz1` (= f_int[2]).
+/// Includes exact consistent cubic P-Delta terms and symmetric shear-rotation spin terms.
+pub fn beam_local_geometric_stiffness(
+    axial_n: f64,
+    vy1: f64,
+    vz1: f64,
+    length: f64,
+) -> SMatrix<f64, 12, 12> {
+    let l = length.max(1e-9);
+    let l2 = l * l;
+    let s = axial_n / l;
+
+    let mut kg = SMatrix::<f64, 12, 12>::zeros();
+
+    // 1. x-y plane (uy1=1, rz1=5, uy2=7, rz2=11)
+    let g_vv = 1.2 * s;
+    let g_vr = 0.1 * l * s;
+    let g_rr1 = (2.0 / 15.0) * l2 * s;
+    let g_rr2 = -(1.0 / 30.0) * l2 * s;
+
+    kg[(1, 1)] = g_vv;
+    kg[(1, 5)] = g_vr;
+    kg[(1, 7)] = -g_vv;
+    kg[(1, 11)] = g_vr;
+
+    kg[(5, 1)] = g_vr;
+    kg[(5, 5)] = g_rr1;
+    kg[(5, 7)] = -g_vr;
+    kg[(5, 11)] = g_rr2;
+
+    kg[(7, 1)] = -g_vv;
+    kg[(7, 5)] = -g_vr;
+    kg[(7, 7)] = g_vv;
+    kg[(7, 11)] = -g_vr;
+
+    kg[(11, 1)] = g_vr;
+    kg[(11, 5)] = g_rr2;
+    kg[(11, 7)] = -g_vr;
+    kg[(11, 11)] = g_rr1;
+
+    // 2. x-z plane (uz1=2, ry1=4, uz2=8, ry2=10; theta_y = -dw/dx)
+    kg[(2, 2)] = g_vv;
+    kg[(2, 4)] = -g_vr;
+    kg[(2, 8)] = -g_vv;
+    kg[(2, 10)] = -g_vr;
+
+    kg[(4, 2)] = -g_vr;
+    kg[(4, 4)] = g_rr1;
+    kg[(4, 8)] = g_vr;
+    kg[(4, 10)] = g_rr2;
+
+    kg[(8, 2)] = -g_vv;
+    kg[(8, 4)] = g_vr;
+    kg[(8, 8)] = g_vv;
+    kg[(8, 10)] = g_vr;
+
+    kg[(10, 2)] = -g_vr;
+    kg[(10, 4)] = g_rr2;
+    kg[(10, 8)] = g_vr;
+    kg[(10, 10)] = g_rr1;
+
+    // 3. Corotational shear-spin coupling terms (axial <-> transverse)
+    let sy = vy1 / l;
+    let sz = vz1 / l;
+
+    kg[(0, 1)] += sy;
+    kg[(1, 0)] += sy;
+    kg[(0, 7)] -= sy;
+    kg[(7, 0)] -= sy;
+    kg[(6, 1)] -= sy;
+    kg[(1, 6)] -= sy;
+    kg[(6, 7)] += sy;
+    kg[(7, 6)] += sy;
+
+    kg[(0, 2)] += sz;
+    kg[(2, 0)] += sz;
+    kg[(0, 8)] -= sz;
+    kg[(8, 0)] -= sz;
+    kg[(6, 2)] -= sz;
+    kg[(2, 6)] -= sz;
+    kg[(6, 8)] += sz;
+    kg[(8, 6)] += sz;
+
+    kg
+}
+
 /// Consistent equivalent nodal load vector `f_eq_local` (12x1) for a linearly varying
 /// local distributed load `q(xi) = (1 - xi) * q_start + xi * q_end` (in N/m).
 /// Note: Fixed-end force vector `f_fef_local = -f_eq_local`.

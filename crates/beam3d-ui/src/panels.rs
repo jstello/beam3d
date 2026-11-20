@@ -1,12 +1,12 @@
-use crate::app::{Beam3dApp, BottomTab, LeftTab};
+use crate::app::{AnalysisMode, Beam3dApp, BottomTab, LeftTab};
 use crate::mesh_gen::{ColorField, DiagramRibbon};
 use beam3d_core::{
-    BeamFormulation, CrossSection, DistributedLoad, LoadCoordSystem, Material, NodalLoad,
-    SectionProfile, SupportPreset,
+    BeamFormulation, CrossSection, DistributedLoad, LoadCoordSystem, MassFormulation, Material,
+    NodalLoad, SectionProfile, SupportPreset,
 };
 use eframe::egui::{self, Color32, RichText, Stroke};
 use egui_extras::{Column, TableBuilder};
-use egui_plot::{HLine, Legend, Line, Plot, PlotPoints};
+use egui_plot::{HLine, Legend, Line, Plot, PlotPoints, VLine};
 
 pub fn draw_left_panel(app: &mut Beam3dApp, ui: &mut egui::Ui) {
     ui.add_space(4.0);
@@ -1029,11 +1029,314 @@ pub fn draw_right_panel(app: &mut Beam3dApp, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            draw_analysis_mode_card(app, ui);
+            ui.add_space(6.0);
             draw_summary_card(app, ui);
             ui.add_space(6.0);
             draw_display_settings_card(app, ui);
             ui.add_space(6.0);
             draw_selection_inspector(app, ui);
+        });
+}
+
+fn draw_analysis_mode_card(app: &mut Beam3dApp, ui: &mut egui::Ui) {
+    let header_title = format!("⚙ Analysis: {}", app.analysis_mode.short_label());
+    egui::CollapsingHeader::new(RichText::new(header_title).strong().color(Color32::from_rgb(130, 225, 195)))
+        .default_open(app.analysis_mode != AnalysisMode::LinearStatic)
+        .show(ui, |ui| {
+            let mut next_mode = app.analysis_mode;
+            egui::ComboBox::from_id_salt("right_analysis_mode")
+                .selected_text(app.analysis_mode.label())
+                .width(230.0)
+                .show_ui(ui, |ui| {
+                    for m in AnalysisMode::ALL {
+                        ui.selectable_value(&mut next_mode, m, m.label());
+                    }
+                });
+            if next_mode != app.analysis_mode {
+                app.analysis_mode = next_mode;
+                if next_mode != AnalysisMode::LinearStatic {
+                    app.bottom_tab = BottomTab::AnalysisCharts;
+                    app.show_bottom_panel = true;
+                }
+                app.run_solver();
+                return;
+            }
+
+            match app.analysis_mode {
+                AnalysisMode::LinearStatic => {
+                    ui.label(
+                        RichText::new("Small-displacement linear elastic static equilibrium (K·u = F).")
+                            .small()
+                            .color(Color32::from_gray(160)),
+                    );
+                }
+                AnalysisMode::NonlinearStatic => {
+                    ui.label(
+                        RichText::new("3D Corotational large-deformation Newton-Raphson (finite rotations, P-Δ, membrane stiffening).")
+                            .small()
+                            .color(Color32::from_gray(170)),
+                    );
+                    let mut changed = false;
+                    ui.horizontal(|ui| {
+                        ui.label("Load Steps:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut app.nl_config.load_steps).range(1..=100))
+                            .changed();
+                        ui.label("Max Iter:");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut app.nl_config.max_iterations_per_step)
+                                    .range(5..=100),
+                            )
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.small_button("True 1:1 Scale").clicked() {
+                            app.disp_scale = 1.0;
+                        }
+                        if ui.small_button("▶ Run Nonlinear").clicked() || changed {
+                            app.run_solver();
+                        }
+                    });
+                    if let Some(nl) = &app.nl_solution {
+                        ui.label(
+                            RichText::new(format!(
+                                "Converged in {} steps ({} Newton iters)",
+                                nl.load_steps.len(),
+                                nl.total_iterations
+                            ))
+                            .small()
+                            .color(Color32::from_rgb(100, 230, 145)),
+                        );
+                    }
+                }
+                AnalysisMode::Modal => {
+                    let mut changed = false;
+                    ui.horizontal(|ui| {
+                        ui.label("Modes:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut app.modal_config.num_modes).range(1..=30))
+                            .changed();
+                        egui::ComboBox::from_id_salt("modal_mass_form")
+                            .selected_text(app.modal_config.mass_formulation.label())
+                            .width(135.0)
+                            .show_ui(ui, |ui| {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut app.modal_config.mass_formulation,
+                                        MassFormulation::Consistent,
+                                        MassFormulation::Consistent.label(),
+                                    )
+                                    .changed();
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut app.modal_config.mass_formulation,
+                                        MassFormulation::Lumped,
+                                        MassFormulation::Lumped.label(),
+                                    )
+                                    .changed();
+                            });
+                    });
+                    if changed {
+                        app.run_solver();
+                    }
+
+                    let mut clicked_mode = None;
+                    if let Some(msol) = &app.modal_solution {
+                        ui.label(
+                            RichText::new(format!("Total Structural Mass: {:.1} kg", msol.total_mass_kg))
+                                .small()
+                                .color(Color32::from_gray(175)),
+                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("modes_list_scroll")
+                            .max_height(130.0)
+                            .show(ui, |ui| {
+                                for (i, mode) in msol.modes.iter().enumerate() {
+                                    let sel = app.selected_mode_idx == i;
+                                    let txt = format!(
+                                        "Mode {:<2}  f = {:>7.3} Hz  T = {:>6.3} s",
+                                        mode.mode_index, mode.frequency_hz, mode.period_s
+                                    );
+                                    if ui
+                                        .selectable_label(sel, RichText::new(txt).monospace().size(11.0))
+                                        .clicked()
+                                    {
+                                        clicked_mode = Some(i);
+                                    }
+                                }
+                            });
+                    }
+                    if let Some(i) = clicked_mode {
+                        app.select_mode(i);
+                    }
+                }
+                AnalysisMode::Dynamic => {
+                    ui.checkbox(
+                        &mut app.dynamic_config.nonlinear,
+                        "Large Deformations (Corotational Nonlinear)",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Duration:");
+                        ui.add(
+                            egui::DragValue::new(&mut app.dynamic_config.duration_s)
+                                .speed(0.05)
+                                .range(0.05..=30.0)
+                                .suffix(" s"),
+                        );
+                        ui.label("dt:");
+                        ui.add(
+                            egui::DragValue::new(&mut app.dynamic_config.dt_s)
+                                .speed(0.001)
+                                .range(0.0005..=0.2)
+                                .suffix(" s"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Damping ζ:");
+                        ui.add(
+                            egui::DragValue::new(&mut app.damping_ratio_pct)
+                                .speed(0.2)
+                                .range(0.0..=50.0)
+                                .suffix(" %"),
+                        );
+                        egui::ComboBox::from_id_salt("dyn_mass_form")
+                            .selected_text(match app.dynamic_config.mass_formulation {
+                                MassFormulation::Consistent => "Consistent",
+                                MassFormulation::Lumped => "Lumped",
+                            })
+                            .width(90.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut app.dynamic_config.mass_formulation,
+                                    MassFormulation::Consistent,
+                                    "Consistent",
+                                );
+                                ui.selectable_value(
+                                    &mut app.dynamic_config.mass_formulation,
+                                    MassFormulation::Lumped,
+                                    "Lumped",
+                                );
+                            });
+                    });
+
+                    let exc_names = [
+                        "Step Load (Heaviside)",
+                        "Rectangular Impulse",
+                        "Half-Sine Pulse",
+                        "Harmonic Sine Force",
+                        "Linear Ramp Load",
+                        "Free Vibration (Pluck)",
+                        "Seismic Base Sine",
+                    ];
+                    egui::ComboBox::from_id_salt("dyn_excitation_kind")
+                        .selected_text(exc_names[app.excitation_kind.min(6)])
+                        .width(210.0)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in exc_names.iter().enumerate() {
+                                ui.selectable_value(&mut app.excitation_kind, i, *name);
+                            }
+                        });
+
+                    match app.excitation_kind {
+                        1 | 2 | 4 => {
+                            ui.horizontal(|ui| {
+                                ui.label(if app.excitation_kind == 4 { "Rise time:" } else { "Pulse duration:" });
+                                ui.add(
+                                    egui::DragValue::new(&mut app.exc_duration_s)
+                                        .speed(0.01)
+                                        .range(0.005..=10.0)
+                                        .suffix(" s"),
+                                );
+                            });
+                        }
+                        3 => {
+                            ui.horizontal(|ui| {
+                                ui.label("Forcing freq:");
+                                ui.add(
+                                    egui::DragValue::new(&mut app.exc_freq_hz)
+                                        .speed(0.1)
+                                        .range(0.05..=50.0)
+                                        .suffix(" Hz"),
+                                );
+                            });
+                        }
+                        6 => {
+                            ui.horizontal(|ui| {
+                                ui.label("Amp:");
+                                ui.add(
+                                    egui::DragValue::new(&mut app.exc_base_amp_g)
+                                        .speed(0.05)
+                                        .range(0.01..=5.0)
+                                        .suffix(" g"),
+                                );
+                                ui.label("f:");
+                                ui.add(
+                                    egui::DragValue::new(&mut app.exc_freq_hz)
+                                        .speed(0.1)
+                                        .range(0.1..=25.0)
+                                        .suffix(" Hz"),
+                                );
+                                ui.label("Dur:");
+                                ui.add(
+                                    egui::DragValue::new(&mut app.exc_duration_s)
+                                        .speed(0.05)
+                                        .range(0.05..=20.0)
+                                        .suffix(" s"),
+                                );
+                            });
+                        }
+                        _ => {}
+                    }
+
+                    if ui.button("▶ Run Dynamic Simulation").clicked() {
+                        app.run_solver();
+                    }
+
+                    let mut scrub_idx: Option<usize> = None;
+                    if let Some(dsol) = &app.dynamic_solution {
+                        if !dsol.frames.is_empty() {
+                            ui.separator();
+                            let n_frames = dsol.frames.len();
+                            let cur_t = dsol.frames[app.dynamic_frame_idx.min(n_frames - 1)].time_s;
+                            let max_t = dsol.frames.last().unwrap().time_s;
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .small_button(if app.dynamic_playing { "⏸ Pause" } else { "▶ Play" })
+                                    .clicked()
+                                {
+                                    app.dynamic_playing = !app.dynamic_playing;
+                                }
+                                if ui.small_button("⏮").clicked() {
+                                    app.dynamic_playing = false;
+                                    scrub_idx = Some(0);
+                                }
+                                ui.label(
+                                    RichText::new(format!("t = {:.3} / {:.2} s", cur_t, max_t))
+                                        .monospace()
+                                        .small(),
+                                );
+                            });
+                            let mut idx_val = app.dynamic_frame_idx.min(n_frames - 1);
+                            if ui
+                                .add(egui::Slider::new(&mut idx_val, 0..=(n_frames - 1)).text("Frame"))
+                                .changed()
+                            {
+                                app.dynamic_playing = false;
+                                scrub_idx = Some(idx_val);
+                            }
+                            ui.add(
+                                egui::Slider::new(&mut app.dynamic_speed, 0.1..=4.0)
+                                    .text("Playback ×"),
+                            );
+                        }
+                    }
+                    if let Some(i) = scrub_idx {
+                        app.set_dynamic_frame(i);
+                    }
+                }
+            }
         });
 }
 
@@ -1466,6 +1769,19 @@ fn draw_node_inspector(app: &mut Beam3dApp, ui: &mut egui::Ui, nid: usize) {
                 }
             });
 
+            ui.horizontal(|ui| {
+                ui.label("Added Point Mass:");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut node.added_mass)
+                            .speed(1.0)
+                            .range(0.0..=1.0e8)
+                            .suffix(" kg"),
+                    )
+                    .on_hover_text("Lumped translational mass attached to this node for modal & dynamic analysis")
+                    .changed();
+            });
+
             let cur_preset = SupportPreset::from_restraints(&node.restraints);
             let mut sel_preset = cur_preset;
             egui::ComboBox::from_label("Support")
@@ -1766,6 +2082,11 @@ pub fn draw_bottom_panel(app: &mut Beam3dApp, ui: &mut egui::Ui) {
         );
         ui.selectable_value(
             &mut app.bottom_tab,
+            BottomTab::AnalysisCharts,
+            "📉 Nonlinear / Dynamic Charts",
+        );
+        ui.selectable_value(
+            &mut app.bottom_tab,
             BottomTab::ReactionsTable,
             "⚓ Support Reactions Table",
         );
@@ -1779,8 +2100,205 @@ pub fn draw_bottom_panel(app: &mut Beam3dApp, ui: &mut egui::Ui) {
 
     match app.bottom_tab {
         BottomTab::MemberDiagrams => draw_member_diagrams_tab(app, ui),
+        BottomTab::AnalysisCharts => draw_analysis_charts_tab(app, ui),
         BottomTab::ReactionsTable => draw_reactions_table(app, ui),
         BottomTab::DisplacementsTable => draw_displacements_table(app, ui),
+    }
+}
+
+fn draw_analysis_charts_tab(app: &mut Beam3dApp, ui: &mut egui::Ui) {
+    match app.analysis_mode {
+        AnalysisMode::LinearStatic => {
+            ui.label(
+                RichText::new("Switch Analysis Mode (top toolbar or right panel) to Nonlinear Static, Modal, or Dynamic Time-History to view load-displacement curves, natural frequencies, or time-history plots.")
+                    .color(Color32::from_gray(170)),
+            );
+        }
+        AnalysisMode::NonlinearStatic => {
+            let Some(nl) = &app.nl_solution else {
+                ui.label("Run Nonlinear Static analysis to plot the equilibrium load-displacement curve.");
+                return;
+            };
+            let mut pts_vec = vec![[0.0, 0.0]];
+            for rec in &nl.load_steps {
+                pts_vec.push([rec.max_displacement_m * 1e3, rec.load_factor]);
+            }
+            let pts: PlotPoints = pts_vec.into();
+            let avail_h = ui.available_height().max(120.0);
+            Plot::new("plot_nl_load_disp")
+                .height(avail_h)
+                .legend(Legend::default())
+                .x_axis_label("Max Displacement |u| (mm)")
+                .y_axis_label("Load Factor λ")
+                .show(ui, |pui| {
+                    pui.line(
+                        Line::new("Equilibrium Path λ(|u|)", pts)
+                            .color(Color32::from_rgb(95, 225, 165))
+                            .width(2.0),
+                    );
+                });
+        }
+        AnalysisMode::Modal => {
+            let Some(msol) = &app.modal_solution else {
+                ui.label("Run Modal analysis to inspect natural frequencies and modal mass participation.");
+                return;
+            };
+            let mut clicked = None;
+            TableBuilder::new(ui)
+                .striped(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::initial(65.0))
+                .columns(Column::initial(95.0), 6)
+                .header(20.0, |mut header| {
+                    for h in [
+                        "Mode",
+                        "Freq (Hz)",
+                        "Period (s)",
+                        "ω (rad/s)",
+                        "Mass X (%)",
+                        "Mass Y (%)",
+                        "Mass Z (%)",
+                    ] {
+                        header.col(|ui| {
+                            ui.strong(h);
+                        });
+                    }
+                })
+                .body(|mut body| {
+                    for (i, m) in msol.modes.iter().enumerate() {
+                        body.row(18.0, |mut row| {
+                            row.col(|ui| {
+                                if ui
+                                    .selectable_label(
+                                        app.selected_mode_idx == i,
+                                        format!("Mode {}", m.mode_index),
+                                    )
+                                    .clicked()
+                                {
+                                    clicked = Some(i);
+                                }
+                            });
+                            row.col(|ui| {
+                                ui.monospace(format!("{:.4}", m.frequency_hz));
+                            });
+                            row.col(|ui| {
+                                ui.monospace(format!("{:.4}", m.period_s));
+                            });
+                            row.col(|ui| {
+                                ui.monospace(format!("{:.3}", m.omega_rad_s));
+                            });
+                            for d in 0..3 {
+                                row.col(|ui| {
+                                    ui.monospace(format!("{:.1}%", m.effective_mass_ratio[d] * 100.0));
+                                });
+                            }
+                        });
+                    }
+                });
+            if let Some(i) = clicked {
+                app.select_mode(i);
+            }
+        }
+        AnalysisMode::Dynamic => {
+            let Some(dsol) = &app.dynamic_solution else {
+                ui.label("Run Dynamic Time-History analysis to view displacement & energy time histories.");
+                return;
+            };
+            let cur_t = dsol
+                .frames
+                .get(app.dynamic_frame_idx)
+                .map(|f| f.time_s)
+                .unwrap_or(0.0);
+
+            let avail_w = ui.available_width();
+            let plot_w = ((avail_w - 16.0) * 0.5).max(180.0);
+            let plot_h = ui.available_height().max(120.0);
+
+            let peak_pts: PlotPoints = dsol
+                .history
+                .iter()
+                .map(|h| [h.time_s, h.max_displacement_m * 1e3])
+                .collect();
+
+            let sel_node_pts: Option<(usize, PlotPoints, PlotPoints)> = app.selected_node.map(|nid| {
+                let uz: PlotPoints = dsol
+                    .history
+                    .iter()
+                    .map(|h| [h.time_s, h.node_translations.get(&nid).map(|v| v[2] * 1e3).unwrap_or(0.0)])
+                    .collect();
+                let ux: PlotPoints = dsol
+                    .history
+                    .iter()
+                    .map(|h| [h.time_s, h.node_translations.get(&nid).map(|v| v[0] * 1e3).unwrap_or(0.0)])
+                    .collect();
+                (nid, uz, ux)
+            });
+
+            let ke_pts: PlotPoints = dsol
+                .history
+                .iter()
+                .map(|h| [h.time_s, h.kinetic_energy_j])
+                .collect();
+            let se_pts: PlotPoints = dsol
+                .history
+                .iter()
+                .map(|h| [h.time_s, h.strain_energy_j])
+                .collect();
+            let tot_pts: PlotPoints = dsol
+                .history
+                .iter()
+                .map(|h| [h.time_s, h.kinetic_energy_j + h.strain_energy_j])
+                .collect();
+
+            ui.horizontal(|ui| {
+                Plot::new("plot_dyn_disp")
+                    .width(plot_w)
+                    .height(plot_h)
+                    .legend(Legend::default())
+                    .x_axis_label("Time t (s)")
+                    .y_axis_label("Displacement (mm)")
+                    .show(ui, |pui| {
+                        pui.hline(HLine::new("", 0.0).color(Color32::from_gray(85)));
+                        pui.vline(VLine::new("", cur_t).color(Color32::from_rgb(255, 220, 90)));
+                        pui.line(
+                            Line::new("Peak |u| (mm)", peak_pts)
+                                .color(Color32::from_rgb(80, 200, 255)),
+                        );
+                        if let Some((nid, uz, ux)) = sel_node_pts {
+                            pui.line(
+                                Line::new(format!("N{nid} uz (mm)"), uz)
+                                    .color(Color32::from_rgb(250, 150, 75)),
+                            );
+                            pui.line(
+                                Line::new(format!("N{nid} ux (mm)"), ux)
+                                    .color(Color32::from_rgb(125, 235, 145)),
+                            );
+                        }
+                    });
+
+                Plot::new("plot_dyn_energy")
+                    .width(plot_w)
+                    .height(plot_h)
+                    .legend(Legend::default())
+                    .x_axis_label("Time t (s)")
+                    .y_axis_label("Energy (J)")
+                    .show(ui, |pui| {
+                        pui.vline(VLine::new("", cur_t).color(Color32::from_rgb(255, 220, 90)));
+                        pui.line(
+                            Line::new("Total (J)", tot_pts)
+                                .color(Color32::from_rgb(235, 235, 235)),
+                        );
+                        pui.line(
+                            Line::new("Kinetic (J)", ke_pts)
+                                .color(Color32::from_rgb(250, 115, 115)),
+                        );
+                        pui.line(
+                            Line::new("Strain (J)", se_pts)
+                                .color(Color32::from_rgb(100, 220, 155)),
+                        );
+                    });
+            });
+        }
     }
 }
 

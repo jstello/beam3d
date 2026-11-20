@@ -184,6 +184,129 @@ pub fn shell_local_stiffness(
     Ok(k)
 }
 
+/// Computes the local `6n × 6n` shell mass matrix (consistent or lumped) for Tri3 or Quad4.
+pub fn shell_local_mass_matrix(
+    frame: &ShellFrame,
+    density: f64,
+    thickness: f64,
+    lumped: bool,
+) -> Result<DMatrix<f64>, String> {
+    let n = frame.local_xy.len();
+    let ndof = n * 6;
+    let t = thickness.max(1e-5);
+    let rho = density.max(0.0);
+
+    let mut m = DMatrix::<f64>::zeros(ndof, ndof);
+    if rho <= 0.0 {
+        return Ok(m);
+    }
+
+    let m_trans = rho * t;
+    let m_rot = rho * t * t * t / 12.0;
+    let m_drill = 1.0e-2 * m_rot;
+
+    // Scalar nodal mass integrals S_{ab} = int_A N_a N_b dA
+    let mut s = DMatrix::<f64>::zeros(n, n);
+    if n == 3 {
+        let a12 = frame.area / 12.0;
+        for a in 0..3 {
+            for b in 0..3 {
+                s[(a, b)] = if a == b { 2.0 * a12 } else { a12 };
+            }
+        }
+    } else {
+        let gp = 1.0 / 3.0_f64.sqrt();
+        let gauss_2x2 = [(-gp, -gp), (gp, -gp), (gp, gp), (-gp, gp)];
+        for &(xi, eta) in &gauss_2x2 {
+            let (n_vals, _, _, det_j) = quad4_shape_at(&frame.local_xy, xi, eta)?;
+            for a in 0..4 {
+                for b in 0..4 {
+                    s[(a, b)] += n_vals[a] * n_vals[b] * det_j;
+                }
+            }
+        }
+    }
+
+    if lumped {
+        for a in 0..n {
+            let mut row_sum = 0.0;
+            for b in 0..n {
+                row_sum += s[(a, b)];
+            }
+            let base = a * 6;
+            m[(base, base)] = m_trans * row_sum;
+            m[(base + 1, base + 1)] = m_trans * row_sum;
+            m[(base + 2, base + 2)] = m_trans * row_sum;
+            m[(base + 3, base + 3)] = m_rot * row_sum;
+            m[(base + 4, base + 4)] = m_rot * row_sum;
+            m[(base + 5, base + 5)] = m_drill * row_sum;
+        }
+    } else {
+        for a in 0..n {
+            for b in 0..n {
+                let sab = s[(a, b)];
+                let ra = a * 6;
+                let rb = b * 6;
+                m[(ra, rb)] = m_trans * sab;
+                m[(ra + 1, rb + 1)] = m_trans * sab;
+                m[(ra + 2, rb + 2)] = m_trans * sab;
+                m[(ra + 3, rb + 3)] = m_rot * sab;
+                m[(ra + 4, rb + 4)] = m_rot * sab;
+                m[(ra + 5, rb + 5)] = m_drill * sab;
+            }
+        }
+    }
+
+    Ok(m)
+}
+
+/// Computes the local `6n × 6n` shell geometric (stress-stiffening) stiffness matrix `K_G`
+/// from in-plane membrane forces `n_mem = [Nxx, Nyy, Nxy]` (N/m).
+pub fn shell_local_geometric_stiffness(
+    frame: &ShellFrame,
+    n_mem: [f64; 3],
+) -> Result<DMatrix<f64>, String> {
+    let n = frame.local_xy.len();
+    let ndof = n * 6;
+    let mut kg = DMatrix::<f64>::zeros(ndof, ndof);
+
+    let [nxx, nyy, nxy] = n_mem;
+    if nxx.abs() + nyy.abs() + nxy.abs() < 1e-12 {
+        return Ok(kg);
+    }
+
+    let mut add_gp = |dn_dx: &[f64], dn_dy: &[f64], weight: f64| {
+        for a in 0..n {
+            for b in 0..n {
+                let g_ab = weight
+                    * (nxx * dn_dx[a] * dn_dx[b]
+                        + nyy * dn_dy[a] * dn_dy[b]
+                        + nxy * (dn_dx[a] * dn_dy[b] + dn_dy[a] * dn_dx[b]));
+                // Apply to all 3 translational DOFs (u, v, w) for frame-invariant 3D membrane stress stiffening
+                let ra = a * 6;
+                let rb = b * 6;
+                kg[(ra, rb)] += g_ab;
+                kg[(ra + 1, rb + 1)] += g_ab;
+                kg[(ra + 2, rb + 2)] += g_ab;
+            }
+        }
+    };
+
+    if n == 3 {
+        let (dn_dx, dn_dy, area) = tri3_shape_derivatives(&frame.local_xy)?;
+        add_gp(&dn_dx, &dn_dy, area);
+    } else {
+        let gp = 1.0 / 3.0_f64.sqrt();
+        let gauss_2x2 = [(-gp, -gp), (gp, -gp), (gp, gp), (-gp, gp)];
+        for &(xi, eta) in &gauss_2x2 {
+            let (_, dn_dx, dn_dy, det_j) = quad4_shape_at(&frame.local_xy, xi, eta)?;
+            add_gp(&dn_dx, &dn_dy, det_j);
+        }
+    }
+
+    Ok(kg)
+}
+
 /// Computes the total global surface traction vector `[px, py, pz]` (Pa = N/m²) on a shell element,
 /// combining self-weight gravity (`rho * t * g`) and all attached `SurfaceLoad` entries.
 pub fn total_global_surface_traction(

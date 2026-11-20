@@ -13,10 +13,11 @@ pub enum TemplateKind {
     PitchedPortalFrame,
     CrankedCantilever3D,
     CantileverBenchmark,
+    FlexibleCantileverElastica,
 }
 
 impl TemplateKind {
-    pub const ALL: [TemplateKind; 7] = [
+    pub const ALL: [TemplateKind; 8] = [
         TemplateKind::MultiStoryBuilding,
         TemplateKind::CompositeSlabOnBeams,
         TemplateKind::SimplySupportedPlate,
@@ -24,6 +25,7 @@ impl TemplateKind {
         TemplateKind::PitchedPortalFrame,
         TemplateKind::CrankedCantilever3D,
         TemplateKind::CantileverBenchmark,
+        TemplateKind::FlexibleCantileverElastica,
     ];
 
     pub fn title(self) -> &'static str {
@@ -35,6 +37,7 @@ impl TemplateKind {
             TemplateKind::PitchedPortalFrame => "Pitched Roof Portal Frame (Snow + Wind)",
             TemplateKind::CrankedCantilever3D => "3D L-Cantilever (Coupled Bending & Torsion)",
             TemplateKind::CantileverBenchmark => "Cantilever Beam (Timoshenko Benchmark)",
+            TemplateKind::FlexibleCantileverElastica => "Flexible Cantilever Strip (Large Deform. & Dynamics)",
         }
     }
 
@@ -47,6 +50,7 @@ impl TemplateKind {
             TemplateKind::PitchedPortalFrame => pitched_portal_frame(),
             TemplateKind::CrankedCantilever3D => cranked_cantilever_3d(),
             TemplateKind::CantileverBenchmark => cantilever_benchmark(),
+            TemplateKind::FlexibleCantileverElastica => flexible_cantilever_elastica(),
         }
     }
 }
@@ -694,6 +698,61 @@ pub fn simply_supported_plate() -> StructuralModel {
             node.restraints[1] = true;
         }
     }
+
+    m
+}
+
+/// Slender 10-element flexible steel cantilever strip (L = 4 m, 30×80 mm) under large tip load.
+/// Ideal for demonstrating 3D corotational large deformations (axial foreshortening & >45° rotation),
+/// modal natural frequencies, and linear vs. nonlinear transient dynamics.
+pub fn flexible_cantilever_elastica() -> StructuralModel {
+    let mut m = StructuralModel {
+        name: "Flexible Cantilever (Large Deform. & Dynamics)".to_string(),
+        description: "Slender 4 m steel strip (10 elements, 30×80 mm) under a large downward tip force (-4.5 kN). Switch Analysis Mode to Nonlinear Static (True 1:1 scale) to see large-rotation elastica foreshortening, or Dynamic Time-History for nonlinear swings!".to_string(),
+        nodes: Vec::new(),
+        materials: vec![Material::structural_steel_s355(1)],
+        sections: vec![CrossSection {
+            id: 1,
+            name: "Slender Strip 30×80 mm".to_string(),
+            profile: SectionProfile::SolidRect {
+                depth: 0.030,
+                width: 0.080,
+            },
+        }],
+        elements: Vec::new(),
+        shells: Vec::new(),
+        nodal_loads: Vec::new(),
+        distributed_loads: Vec::new(),
+        surface_loads: Vec::new(),
+        gravity: GravitySettings {
+            enabled: false,
+            acceleration: [0.0, 0.0, -9.80665],
+        },
+    };
+
+    let l = 4.0;
+    let n_elem = 10usize;
+    let mut ids = Vec::with_capacity(n_elem + 1);
+    for i in 0..=n_elem {
+        ids.push(m.add_node([l * (i as f64 / n_elem as f64), 0.0, 0.0]));
+    }
+    if let Some(n0) = m.get_node_mut(ids[0]) {
+        n0.restraints = SupportPreset::Fixed.to_restraints().unwrap();
+    }
+    for i in 0..n_elem {
+        m.add_beam(ids[i], ids[i + 1], 1, 1);
+    }
+
+    let tip = *ids.last().unwrap();
+    if let Some(nt) = m.get_node_mut(tip) {
+        nt.added_mass = 25.0; // 25 kg tip mass for crisp dynamic oscillation
+    }
+    m.nodal_loads.push(NodalLoad {
+        id: 1,
+        node_id: tip,
+        forces: [0.0, 0.0, -4_500.0],
+        moments: [0.0; 3],
+    });
 
     m
 }
