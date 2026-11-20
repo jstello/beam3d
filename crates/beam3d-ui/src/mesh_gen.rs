@@ -118,8 +118,11 @@ pub struct ViewportDisplayOptions {
     pub hovered_node: Option<usize>,
     pub selected_element: Option<usize>,
     pub hovered_element: Option<usize>,
+    pub selected_shell: Option<usize>,
+    pub hovered_shell: Option<usize>,
     pub preview_point: Option<[f64; 3]>,
     pub beam_draw_start_node: Option<usize>,
+    pub shell_draw_points: Vec<[f64; 3]>,
 }
 
 /// Range metadata returned for drawing the 2D HUD colorbar legend.
@@ -545,7 +548,18 @@ pub fn build_scene_geometry(
         }
     }
 
-    // 5. Applied Nodal & Distributed Loads
+    // 4b. Render 2D Shell / Surface Elements (Tri3 & Quad4)
+    build_shell_surfaces(
+        model,
+        solution,
+        opts,
+        eff_disp_scale,
+        legend,
+        glyph_size,
+        out,
+    );
+
+    // 5. Applied Nodal, Beam Distributed, and 2D Surface Loads
     if opts.show_loads {
         build_load_glyphs(model, solution, eff_disp_scale, glyph_size, out);
     }
@@ -557,7 +571,7 @@ pub fn build_scene_geometry(
         }
     }
 
-    // 7. Interactive AddNode / DrawBeam 3D Cursor Preview + Vertical Z Plumb-Line
+    // 7. Interactive AddNode / DrawBeam / DrawShell 3D Cursor Preview + Vertical Z Plumb-Line
     if let Some(pt) = opts.preview_point {
         let p = Vector3::from(to_f32(pt));
         push_octahedron(
@@ -583,6 +597,58 @@ pub fn build_scene_geometry(
                     p.into(),
                     [0.25, 0.95, 0.85, 0.95],
                 );
+            }
+        }
+    }
+
+    if !opts.shell_draw_points.is_empty() {
+        let mut pts: Vec<Vector3<f32>> = opts
+            .shell_draw_points
+            .iter()
+            .map(|&p| Vector3::from(to_f32(p)))
+            .collect();
+        for &p in &pts {
+            push_octahedron(
+                &mut out.opaque_tris,
+                p,
+                glyph_size * 0.34,
+                [0.30, 0.95, 0.72, 1.0],
+            );
+        }
+        if let Some(cur) = opts.preview_point {
+            pts.push(Vector3::from(to_f32(cur)));
+        }
+        let line_col = [0.28, 0.96, 0.78, 0.95];
+        for i in 0..pts.len().saturating_sub(1) {
+            push_line(&mut out.lines, pts[i].into(), pts[i + 1].into(), line_col);
+        }
+        if pts.len() >= 3 {
+            push_line(
+                &mut out.lines,
+                pts[pts.len() - 1].into(),
+                pts[0].into(),
+                [0.28, 0.96, 0.78, 0.55],
+            );
+            let n = (pts[1] - pts[0]).cross(&(pts[2] - pts[0])).normalize();
+            let fill = [0.22, 0.84, 0.74, 0.32];
+            for k in 1..(pts.len() - 1) {
+                out.transparent_tris.extend_from_slice(&[
+                    MeshVertex {
+                        pos: pts[0].into(),
+                        normal: n.into(),
+                        color: fill,
+                    },
+                    MeshVertex {
+                        pos: pts[k].into(),
+                        normal: n.into(),
+                        color: fill,
+                    },
+                    MeshVertex {
+                        pos: pts[k + 1].into(),
+                        normal: n.into(),
+                        color: fill,
+                    },
+                ]);
             }
         }
     }
@@ -616,12 +682,19 @@ fn compute_legend_range(field: ColorField, solution: Option<&Solution>) -> Optio
             max_display: (s.max_shear_n * 1e-3).max(1e-3),
             diverging: false,
         }),
-        ColorField::MomentMy | ColorField::MomentMz => Some(LegendRange {
-            field,
-            min_display: 0.0,
-            max_display: (s.max_moment_nm * 1e-3).max(1e-3),
-            diverging: false,
-        }),
+        ColorField::MomentMy | ColorField::MomentMz => {
+            let shell_m = sol
+                .shell_results
+                .values()
+                .map(|sr| sr.bending_moments[0].hypot(sr.bending_moments[1]))
+                .fold(0.0_f64, f64::max);
+            Some(LegendRange {
+                field,
+                min_display: 0.0,
+                max_display: (s.max_moment_nm.max(shell_m) * 1e-3).max(1e-3),
+                diverging: false,
+            })
+        }
         ColorField::TorqueT => Some(LegendRange {
             field,
             min_display: 0.0,
@@ -631,11 +704,17 @@ fn compute_legend_range(field: ColorField, solution: Option<&Solution>) -> Optio
         ColorField::NormalStress | ColorField::VonMisesStress => {
             let mut max_pa = s.max_stress_pa;
             if field == ColorField::VonMisesStress {
-                max_pa = sol
+                let beam_vm = sol
                     .element_results
                     .values()
                     .flat_map(|er| er.stations.iter().map(|st| st.von_mises_stress))
                     .fold(0.0_f64, f64::max);
+                let shell_vm = sol
+                    .shell_results
+                    .values()
+                    .map(|sr| sr.max_von_mises_pa)
+                    .fold(0.0_f64, f64::max);
+                max_pa = beam_vm.max(shell_vm);
             }
             Some(LegendRange {
                 field,
@@ -1192,6 +1271,236 @@ fn build_load_glyphs(
                 prev_tail = Some(tail);
             } else {
                 prev_tail = None;
+            }
+        }
+    }
+
+    // 2D Surface pressure load arrows at shell centroids
+    if !model.surface_loads.is_empty() {
+        let max_p = model
+            .surface_loads
+            .iter()
+            .map(|sl| {
+                (sl.pressure[0].powi(2) + sl.pressure[1].powi(2) + sl.pressure[2].powi(2)).sqrt()
+            })
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+
+        for sl in &model.surface_loads {
+            let Some(shell) = model.get_shell(sl.shell_id) else {
+                continue;
+            };
+            let ids = shell.nodes.as_slice();
+            let mut raw_pos = Vec::with_capacity(ids.len());
+            let mut def_center = Vector3::<f32>::zeros();
+            let mut ok = true;
+            for &nid in ids {
+                if let Some(n) = model.get_node(nid) {
+                    raw_pos.push(n.position);
+                    let mut p = Vector3::from(to_f32(n.position));
+                    if disp_scale.abs() > 1e-9 {
+                        if let Some(nr) = solution.and_then(|s| s.node_results.get(&nid)) {
+                            p.x += (disp_scale * nr.displacements[0]) as f32;
+                            p.y += (disp_scale * nr.displacements[1]) as f32;
+                            p.z += (disp_scale * nr.displacements[2]) as f32;
+                        }
+                    }
+                    def_center += p;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            def_center /= ids.len() as f32;
+            let Ok(frame) = beam3d_core::ShellFrame::compute(&raw_pos) else {
+                continue;
+            };
+            let p_glob = match sl.coord_system {
+                LoadCoordSystem::Global => nalgebra::Vector3::from(sl.pressure),
+                LoadCoordSystem::Local => frame.r_mat.transpose() * nalgebra::Vector3::from(sl.pressure),
+            };
+            let p_mag = p_glob.norm();
+            if p_mag > 1e-3 {
+                let dir = Vector3::new(
+                    (p_glob.x / p_mag) as f32,
+                    (p_glob.y / p_mag) as f32,
+                    (p_glob.z / p_mag) as f32,
+                );
+                let h = glyph_size * (0.95 + 1.55 * ((p_mag / max_p) as f32).sqrt());
+                let tail = def_center - dir * h;
+                push_arrow_3d(
+                    &mut out.opaque_tris,
+                    tail,
+                    def_center - dir * (glyph_size * 0.10),
+                    glyph_size * 0.085,
+                    [0.98, 0.56, 0.24, 1.0],
+                );
+            }
+        }
+    }
+}
+
+fn build_shell_surfaces(
+    model: &StructuralModel,
+    solution: Option<&Solution>,
+    opts: &ViewportDisplayOptions,
+    eff_disp_scale: f64,
+    legend: Option<LegendRange>,
+    glyph_size: f32,
+    out: &mut SceneGeometry,
+) {
+    for shell in &model.shells {
+        let ids = shell.nodes.as_slice();
+        let mut pts = Vec::with_capacity(ids.len());
+        let mut undef_pts = Vec::with_capacity(ids.len());
+        let mut corner_umag = Vec::with_capacity(ids.len());
+        let mut ok = true;
+
+        for &nid in ids {
+            let Some(n) = model.get_node(nid) else {
+                ok = false;
+                break;
+            };
+            undef_pts.push(Vector3::from(to_f32(n.position)));
+            let mut p = Vector3::from(to_f32(n.position));
+            let mut umag_mm = 0.0_f64;
+            if let Some(nr) = solution.and_then(|s| s.node_results.get(&nid)) {
+                let d = nr.displacements;
+                umag_mm = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() * 1e3;
+                if eff_disp_scale.abs() > 1e-9 {
+                    p.x += (eff_disp_scale * d[0]) as f32;
+                    p.y += (eff_disp_scale * d[1]) as f32;
+                    p.z += (eff_disp_scale * d[2]) as f32;
+                }
+            }
+            pts.push(p);
+            corner_umag.push(umag_mm);
+        }
+        if !ok || pts.len() < 3 {
+            continue;
+        }
+
+        // Optional undeformed ghost wireframe outline for shells
+        if eff_disp_scale.abs() > 1e-9 && opts.show_undeformed_ghost {
+            for k in 0..undef_pts.len() {
+                push_line(
+                    &mut out.lines,
+                    undef_pts[k].into(),
+                    undef_pts[(k + 1) % undef_pts.len()].into(),
+                    [0.40, 0.45, 0.54, 0.30],
+                );
+            }
+        }
+
+        let is_selected = opts.selected_shell == Some(shell.id);
+        let is_hovered = opts.hovered_shell == Some(shell.id);
+        let sr = solution.and_then(|s| s.shell_results.get(&shell.id));
+
+        let base_col = [0.56_f32, 0.62, 0.70, 0.96];
+        let uniform_shell_col = match (opts.color_field, sr, legend) {
+            (ColorField::VonMisesStress, Some(r), Some(leg)) => {
+                colormap_scientific(((r.max_von_mises_pa * 1e-6) / leg.max_display) as f32)
+            }
+            (ColorField::NormalStress, Some(r), Some(leg)) => {
+                colormap_scientific(((r.max_normal_stress_pa * 1e-6) / leg.max_display) as f32)
+            }
+            (ColorField::Utilization, Some(r), _) => {
+                colormap_scientific(r.utilization as f32)
+            }
+            (ColorField::MomentMy | ColorField::MomentMz, Some(r), Some(leg)) => {
+                let m_knm = r.bending_moments[0].hypot(r.bending_moments[1]) * 1e-3;
+                colormap_scientific((m_knm / leg.max_display) as f32)
+            }
+            _ => base_col,
+        };
+
+        let corner_color = |idx: usize| -> [f32; 4] {
+            let mut c = if opts.color_field == ColorField::DisplacementMag {
+                if let Some(leg) = legend {
+                    colormap_scientific((corner_umag[idx] / leg.max_display) as f32)
+                } else {
+                    base_col
+                }
+            } else {
+                uniform_shell_col
+            };
+            if is_selected {
+                c = mix_color(c, [1.0, 0.80, 0.22, 1.0], 0.45);
+            } else if is_hovered {
+                c = mix_color(c, [0.45, 0.90, 1.0, 1.0], 0.30);
+            }
+            c
+        };
+
+        // Triangulate Tri3 (1 tri) or Quad4 (2 tris)
+        let tri_indices: &[[usize; 3]] = if pts.len() == 3 {
+            &[[0, 1, 2]]
+        } else {
+            &[[0, 1, 2], [0, 2, 3]]
+        };
+
+        for &[a, b, c_idx] in tri_indices {
+            let normal = (pts[b] - pts[a]).cross(&(pts[c_idx] - pts[a]));
+            let n = if normal.norm() > 1e-6 {
+                normal.normalize()
+            } else {
+                Vector3::new(0.0, 0.0, 1.0)
+            };
+            out.opaque_tris.extend_from_slice(&[
+                MeshVertex {
+                    pos: pts[a].into(),
+                    normal: n.into(),
+                    color: corner_color(a),
+                },
+                MeshVertex {
+                    pos: pts[b].into(),
+                    normal: n.into(),
+                    color: corner_color(b),
+                },
+                MeshVertex {
+                    pos: pts[c_idx].into(),
+                    normal: n.into(),
+                    color: corner_color(c_idx),
+                },
+            ]);
+        }
+
+        // Crisp mesh edge lines
+        let edge_col = if is_selected {
+            [1.0, 0.86, 0.25, 1.0]
+        } else if is_hovered {
+            [0.55, 0.92, 1.0, 0.95]
+        } else {
+            [0.14, 0.18, 0.24, 0.78]
+        };
+        for k in 0..pts.len() {
+            push_line(
+                &mut out.lines,
+                pts[k].into(),
+                pts[(k + 1) % pts.len()].into(),
+                edge_col,
+            );
+        }
+
+        // Optional local outward normal indicator at shell centroid
+        if opts.show_local_axes {
+            let mut c_pos = Vector3::<f32>::zeros();
+            for p in &pts {
+                c_pos += *p;
+            }
+            c_pos /= pts.len() as f32;
+            let n = (pts[1] - pts[0]).cross(&(pts[2] - pts[0]));
+            if n.norm() > 1e-6 {
+                let n = n.normalize();
+                push_line(
+                    &mut out.lines,
+                    c_pos.into(),
+                    (c_pos + n * (glyph_size * 1.1)).into(),
+                    [0.32, 0.65, 1.0, 0.95],
+                );
             }
         }
     }

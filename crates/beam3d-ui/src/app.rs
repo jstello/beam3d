@@ -6,7 +6,9 @@ use crate::mesh_gen::{
 use crate::panels::{draw_bottom_panel, draw_left_panel, draw_right_panel};
 use crate::renderer::{CameraUniform, SceneGeometry, ViewportRenderer};
 use crate::tutorials::{TutorialState, TutorialTrack, draw_tutorial_window, start_tutorial};
-use beam3d_core::{Solution, StructuralModel, TemplateKind, solve_linear_static};
+use beam3d_core::{
+    LoadCoordSystem, Solution, StructuralModel, TemplateKind, solve_linear_static,
+};
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, RichText, Stroke};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +16,7 @@ pub enum EditorTool {
     Select,
     AddNode,
     DrawBeam,
+    DrawShell,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,8 +45,10 @@ pub struct Beam3dApp {
 
     pub selected_node: Option<usize>,
     pub selected_element: Option<usize>,
+    pub selected_shell: Option<usize>,
     pub hovered_node: Option<usize>,
     pub hovered_element: Option<usize>,
+    pub hovered_shell: Option<usize>,
 
     pub selected_section_idx: usize,
     pub selected_material_idx: usize,
@@ -54,6 +59,15 @@ pub struct Beam3dApp {
 
     pub tool: EditorTool,
     pub beam_draw_start: Option<usize>,
+    pub shell_draw_points: Vec<[f64; 3]>,
+    pub new_shell_nx: usize,
+    pub new_shell_ny: usize,
+    pub new_shell_thickness_mm: f64,
+    pub new_shell_apply_load: bool,
+    pub new_shell_pressure_kpa: f64,
+    pub bulk_sload_coord: LoadCoordSystem,
+    pub bulk_sload_kpa: [f64; 3],
+    pub panel_gen_bounds: [f64; 5], // [x0, x1, y0, y1, z]
     pub workplane_kind: WorkplaneKind,
     pub workplane_offset: f64,
     pub snap_grid: f64,
@@ -111,8 +125,10 @@ impl Beam3dApp {
             dirty_solve: true,
             selected_node: None,
             selected_element: Some(1),
+            selected_shell: None,
             hovered_node: None,
             hovered_element: None,
+            hovered_shell: None,
             selected_section_idx: 0,
             selected_material_idx: 0,
             new_node_pos: [0.0, 0.0, 0.0],
@@ -121,6 +137,15 @@ impl Beam3dApp {
             subdivide_count: 4,
             tool: EditorTool::Select,
             beam_draw_start: None,
+            shell_draw_points: Vec::new(),
+            new_shell_nx: 4,
+            new_shell_ny: 4,
+            new_shell_thickness_mm: 150.0,
+            new_shell_apply_load: true,
+            new_shell_pressure_kpa: -5.0,
+            bulk_sload_coord: LoadCoordSystem::Global,
+            bulk_sload_kpa: [0.0, 0.0, -5.0],
+            panel_gen_bounds: [0.0, 6.0, 0.0, 5.0, 0.0],
             workplane_kind: WorkplaneKind::XY,
             workplane_offset: 0.0,
             snap_grid: 0.5,
@@ -217,9 +242,15 @@ impl Beam3dApp {
         self.model = new_model;
         self.selected_node = None;
         self.selected_element = self.model.elements.first().map(|e| e.id);
+        self.selected_shell = if self.selected_element.is_none() {
+            self.model.shells.first().map(|s| s.id)
+        } else {
+            None
+        };
         self.selected_section_idx = 0;
         self.selected_material_idx = 0;
         self.beam_draw_start = None;
+        self.shell_draw_points.clear();
         let (min_p, max_p) = self.model.bounding_box();
         self.camera.set_preset_iso();
         self.camera.fit_to_bounds(min_p, max_p);
@@ -379,7 +410,27 @@ impl eframe::App for Beam3dApp {
                         self.redo();
                     }
 
-                    ui.separator();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.toggle_value(&mut self.show_bottom_panel, "📊 Charts & Tables");
+                        ui.checkbox(&mut self.auto_solve, "Auto-Solve");
+                        let solve_btn = egui::Button::new(
+                            RichText::new("▶ Solve FEA")
+                                .strong()
+                                .color(Color32::from_rgb(15, 30, 20)),
+                        )
+                        .fill(Color32::from_rgb(80, 215, 135));
+                        if ui.add(solve_btn).clicked() {
+                            self.run_solver();
+                        }
+                    });
+                });
+            });
+
+        // 1b. Modeling & 3D Working Plane Sub-Toolbar (prevents horizontal crowding!)
+        egui::Panel::top("modeling_toolbar")
+            .exact_size(32.0)
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
                     ui.label(RichText::new("Tool:").small().color(Color32::from_gray(170)));
                     if ui
                         .selectable_label(self.tool == EditorTool::Select, "🖱 Select")
@@ -387,6 +438,7 @@ impl eframe::App for Beam3dApp {
                     {
                         self.tool = EditorTool::Select;
                         self.beam_draw_start = None;
+                        self.shell_draw_points.clear();
                     }
                     if ui
                         .selectable_label(self.tool == EditorTool::AddNode, "⊕ Add Node")
@@ -394,12 +446,22 @@ impl eframe::App for Beam3dApp {
                     {
                         self.tool = EditorTool::AddNode;
                         self.beam_draw_start = None;
+                        self.shell_draw_points.clear();
                     }
                     if ui
                         .selectable_label(self.tool == EditorTool::DrawBeam, "📏 Draw Beam")
                         .clicked()
                     {
                         self.tool = EditorTool::DrawBeam;
+                        self.shell_draw_points.clear();
+                    }
+                    if ui
+                        .selectable_label(self.tool == EditorTool::DrawShell, "▦ Draw Shell")
+                        .on_hover_text("Click 4 corners to generate a 2D shell mesh (or 3 corners + Enter for a Tri3 shell)")
+                        .clicked()
+                    {
+                        self.tool = EditorTool::DrawShell;
+                        self.beam_draw_start = None;
                     }
 
                     ui.separator();
@@ -431,29 +493,36 @@ impl eframe::App for Beam3dApp {
                             .speed(0.25)
                             .suffix("m"),
                     );
-                    if self.tool != EditorTool::Select {
-                        ui.label(RichText::new("Snap:").small());
-                        ui.add(
-                            egui::DragValue::new(&mut self.snap_grid)
-                                .speed(0.05)
-                                .range(0.0..=5.0)
-                                .suffix("m"),
-                        );
-                    }
+                    ui.label(RichText::new("Snap:").small());
+                    ui.add(
+                        egui::DragValue::new(&mut self.snap_grid)
+                            .speed(0.05)
+                            .range(0.0..=5.0)
+                            .suffix("m"),
+                    );
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.toggle_value(&mut self.show_bottom_panel, "📊 Charts & Tables");
-                        ui.checkbox(&mut self.auto_solve, "Auto-Solve");
-                        let solve_btn = egui::Button::new(
-                            RichText::new("▶ Solve FEA")
-                                .strong()
-                                .color(Color32::from_rgb(15, 30, 20)),
-                        )
-                        .fill(Color32::from_rgb(80, 215, 135));
-                        if ui.add(solve_btn).clicked() {
-                            self.run_solver();
+                    if self.tool == EditorTool::DrawShell {
+                        ui.separator();
+                        ui.label(RichText::new("Mesh:").small());
+                        ui.add(egui::DragValue::new(&mut self.new_shell_nx).range(1..=20));
+                        ui.label(RichText::new("×").small());
+                        ui.add(egui::DragValue::new(&mut self.new_shell_ny).range(1..=20));
+                        ui.label(RichText::new("t:").small());
+                        ui.add(
+                            egui::DragValue::new(&mut self.new_shell_thickness_mm)
+                                .speed(5.0)
+                                .range(2.0..=2000.0)
+                                .suffix(" mm"),
+                        );
+                        ui.checkbox(&mut self.new_shell_apply_load, "2D Load:");
+                        if self.new_shell_apply_load {
+                            ui.add(
+                                egui::DragValue::new(&mut self.new_shell_pressure_kpa)
+                                    .speed(0.5)
+                                    .suffix(" kN/m²"),
+                            );
                         }
-                    });
+                    }
                 });
             });
 
@@ -554,13 +623,45 @@ fn handle_global_shortcuts(app: &mut Beam3dApp, ctx: &egui::Context) {
                 app.workplane_offset
             );
         }
+        if i.key_pressed(egui::Key::Enter)
+            && app.tool == EditorTool::DrawShell
+            && app.shell_draw_points.len() == 3
+        {
+            let pts = app.shell_draw_points.clone();
+            app.shell_draw_points.clear();
+            let mat_id = app.model.materials.last().map(|m| m.id).unwrap_or(1);
+            app.push_undo();
+            let n0 = app.model.find_or_add_node(pts[0], 1e-3);
+            let n1 = app.model.find_or_add_node(pts[1], 1e-3);
+            let n2 = app.model.find_or_add_node(pts[2], 1e-3);
+            if let Some(sid) =
+                app.model
+                    .add_shell_tri([n0, n1, n2], mat_id, app.new_shell_thickness_mm * 1e-3)
+            {
+                if app.new_shell_apply_load && app.new_shell_pressure_kpa.abs() > 1e-6 {
+                    app.model.apply_surface_load_to_shells(
+                        &[sid],
+                        LoadCoordSystem::Global,
+                        [0.0, 0.0, app.new_shell_pressure_kpa * 1e3],
+                        false,
+                    );
+                }
+                app.selected_shell = Some(sid);
+                app.selected_node = None;
+                app.selected_element = None;
+                app.mark_model_changed();
+                app.status_msg = format!("Created Tri3 Shell S{sid}.");
+            }
+        }
         if i.key_pressed(egui::Key::Escape) {
-            if app.beam_draw_start.is_some() {
+            if app.beam_draw_start.is_some() || !app.shell_draw_points.is_empty() {
                 app.beam_draw_start = None;
+                app.shell_draw_points.clear();
             } else {
                 app.tool = EditorTool::Select;
                 app.selected_node = None;
                 app.selected_element = None;
+                app.selected_shell = None;
             }
         }
         if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
@@ -571,6 +672,10 @@ fn handle_global_shortcuts(app: &mut Beam3dApp, ctx: &egui::Context) {
             } else if let Some(eid) = app.selected_element.take() {
                 app.push_undo();
                 app.model.remove_element(eid);
+                app.mark_model_changed();
+            } else if let Some(sid) = app.selected_shell.take() {
+                app.push_undo();
+                app.model.remove_shell(sid);
                 app.mark_model_changed();
             }
         }
@@ -616,6 +721,7 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
     // 3D Hover picking & workplane cursor snapping
     app.hovered_node = None;
     app.hovered_element = None;
+    app.hovered_shell = None;
     let mut preview_point: Option<[f64; 3]> = None;
 
     if let Some(cursor) = response.hover_pos() {
@@ -652,7 +758,39 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
             }
         }
 
-        // 3. Workplane preview point for AddNode / DrawBeam tools (supports XY, XZ, and YZ planes!)
+        // 2b. Closest 2D shell surface if not hovering a node or beam
+        if app.hovered_node.is_none() && app.hovered_element.is_none() {
+            let mut best_depth = f32::INFINITY;
+            for shell in &app.model.shells {
+                let ids = shell.nodes.as_slice();
+                let mut proj: Vec<(Pos2, f32)> = Vec::with_capacity(ids.len());
+                for &nid in ids {
+                    if let Some(n) = app.model.get_node(nid) {
+                        if let Some(sp) = app.camera.project_to_screen(n.position, rect) {
+                            proj.push(sp);
+                        }
+                    }
+                }
+                if proj.len() == ids.len() {
+                    let tris: &[[usize; 3]] = if proj.len() == 3 {
+                        &[[0, 1, 2]]
+                    } else {
+                        &[[0, 1, 2], [0, 2, 3]]
+                    };
+                    for &[a, b, c] in tris {
+                        if point_in_triangle_2d(cursor, proj[a].0, proj[b].0, proj[c].0) {
+                            let avg_z = (proj[a].1 + proj[b].1 + proj[c].1) / 3.0;
+                            if avg_z < best_depth {
+                                best_depth = avg_z;
+                                app.hovered_shell = Some(shell.id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Workplane preview point for AddNode / DrawBeam / DrawShell tools (supports XY, XZ, and YZ planes!)
         if app.tool != EditorTool::Select {
             if let Some(nid) = app.hovered_node {
                 preview_point = app.model.get_node(nid).map(|n| n.position);
@@ -673,8 +811,9 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
     }
 
     // Click handling
-    if response.clicked_by(egui::PointerButton::Secondary) && app.beam_draw_start.is_some() {
+    if response.clicked_by(egui::PointerButton::Secondary) {
         app.beam_draw_start = None;
+        app.shell_draw_points.clear();
     }
 
     if response.clicked_by(egui::PointerButton::Primary) {
@@ -683,12 +822,19 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
                 if let Some(nid) = app.hovered_node {
                     app.selected_node = Some(nid);
                     app.selected_element = None;
+                    app.selected_shell = None;
                 } else if let Some(eid) = app.hovered_element {
                     app.selected_element = Some(eid);
                     app.selected_node = None;
+                    app.selected_shell = None;
+                } else if let Some(sid) = app.hovered_shell {
+                    app.selected_shell = Some(sid);
+                    app.selected_node = None;
+                    app.selected_element = None;
                 } else {
                     app.selected_node = None;
                     app.selected_element = None;
+                    app.selected_shell = None;
                 }
             }
             EditorTool::AddNode => {
@@ -697,6 +843,7 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
                     let nid = app.model.find_or_add_node(pt, 1e-3);
                     app.selected_node = Some(nid);
                     app.selected_element = None;
+                    app.selected_shell = None;
                     app.mark_model_changed();
                     app.status_msg =
                         format!("Placed Node N{nid} at ({:.2}, {:.2}, {:.2}) m", pt[0], pt[1], pt[2]);
@@ -723,6 +870,7 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
                             if let Some(eid) = app.model.add_beam(start_nid, nid, mat_id, sec_id) {
                                 app.selected_element = Some(eid);
                                 app.selected_node = None;
+                                app.selected_shell = None;
                                 app.mark_model_changed();
                                 app.status_msg = format!(
                                     "Created Beam B{eid} (N{start_nid} → N{nid}). Press [P] to switch plane (XY/XZ/YZ) or Esc to end chain."
@@ -744,6 +892,61 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
                             app.workplane_kind.short_label(),
                             app.workplane_kind.normal_axis_name(),
                             app.workplane_offset
+                        );
+                    }
+                }
+            }
+            EditorTool::DrawShell => {
+                if let Some(pt) = preview_point {
+                    app.shell_draw_points.push(pt);
+                    let count = app.shell_draw_points.len();
+                    if count < 4 {
+                        app.status_msg = format!(
+                            "Draw Shell: Corner {count}/4 placed ({:.2}, {:.2}, {:.2}) m — click corner {}{}",
+                            pt[0],
+                            pt[1],
+                            pt[2],
+                            count + 1,
+                            if count == 3 { " (or press Enter for a Tri3 shell)" } else { "" }
+                        );
+                    } else {
+                        let corners = [
+                            app.shell_draw_points[0],
+                            app.shell_draw_points[1],
+                            app.shell_draw_points[2],
+                            app.shell_draw_points[3],
+                        ];
+                        app.shell_draw_points.clear();
+                        let mat_id = app.model.materials.last().map(|m| m.id).unwrap_or(1);
+                        let load_opt = if app.new_shell_apply_load
+                            && app.new_shell_pressure_kpa.abs() > 1e-6
+                        {
+                            Some((
+                                LoadCoordSystem::Global,
+                                [0.0, 0.0, app.new_shell_pressure_kpa * 1e3],
+                            ))
+                        } else {
+                            None
+                        };
+                        app.push_undo();
+                        let created = app.model.add_shell_mesh_quad(
+                            corners,
+                            app.new_shell_nx,
+                            app.new_shell_ny,
+                            mat_id,
+                            app.new_shell_thickness_mm * 1e-3,
+                            load_opt,
+                        );
+                        app.selected_shell = created.first().copied();
+                        app.selected_node = None;
+                        app.selected_element = None;
+                        app.mark_model_changed();
+                        app.status_msg = format!(
+                            "Generated {}×{} 2D shell mesh ({} Quad4 elements, t = {:.0} mm).",
+                            app.new_shell_nx,
+                            app.new_shell_ny,
+                            created.len(),
+                            app.new_shell_thickness_mm
                         );
                     }
                 }
@@ -778,8 +981,11 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
         hovered_node: app.hovered_node,
         selected_element: app.selected_element,
         hovered_element: app.hovered_element,
+        selected_shell: app.selected_shell,
+        hovered_shell: app.hovered_shell,
         preview_point,
         beam_draw_start_node: app.beam_draw_start,
+        shell_draw_points: app.shell_draw_points.clone(),
     };
 
     let legend = build_scene_geometry(
@@ -890,6 +1096,23 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
                 }
                 draw_floating_badge(&painter, cursor + egui::vec2(14.0, 14.0), &tip);
             }
+        } else if let Some(sid) = app.hovered_shell {
+            if let Some(sh) = app.model.get_shell(sid) {
+                let mut tip = format!("Shell S{} (t = {:.0} mm)", sh.id, sh.thickness * 1e3);
+                if let Some(sr) = app
+                    .solution
+                    .as_ref()
+                    .and_then(|s| s.shell_results.get(&sid))
+                {
+                    tip.push_str(&format!(
+                        "\n|u| = {:.3} mm | σ_vm = {:.2} MPa | Util = {:.1}%",
+                        sr.centroid_disp_mag_m * 1e3,
+                        sr.max_von_mises_pa * 1e-6,
+                        sr.utilization * 100.0
+                    ));
+                }
+                draw_floating_badge(&painter, cursor + egui::vec2(14.0, 14.0), &tip);
+            }
         }
     }
 
@@ -951,6 +1174,7 @@ fn draw_central_3d_viewport(app: &mut Beam3dApp, ui: &mut egui::Ui, frame: &mut 
                     let mode_name = match app.tool {
                         EditorTool::AddNode => "⊕ ADD NODE",
                         EditorTool::DrawBeam => "📏 DRAW BEAM",
+                        EditorTool::DrawShell => "▦ DRAW SHELL (4 pts)",
                         EditorTool::Select => "",
                     };
                     let axis_name = app.workplane_kind.normal_axis_name();
@@ -1181,4 +1405,16 @@ fn configure_engineering_theme(ctx: &egui::Context) {
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(50, 62, 82);
     visuals.widgets.active.bg_fill = Color32::from_rgb(60, 118, 195);
     ctx.set_visuals(visuals);
+}
+
+fn point_in_triangle_2d(p: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
+    let sign = |p1: Pos2, p2: Pos2, p3: Pos2| -> f32 {
+        (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y)
+    };
+    let d1 = sign(p, a, b);
+    let d2 = sign(p, b, c);
+    let d3 = sign(p, c, a);
+    let has_neg = (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0);
+    let has_pos = (d1 > 0.0) || (d2 > 0.0) || (d3 > 0.0);
+    !(has_neg && has_pos)
 }

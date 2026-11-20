@@ -7,6 +7,8 @@ use crate::section::{CrossSection, SectionProfile};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemplateKind {
     MultiStoryBuilding,
+    CompositeSlabOnBeams,
+    SimplySupportedPlate,
     TiedArchBridge,
     PitchedPortalFrame,
     CrankedCantilever3D,
@@ -14,8 +16,10 @@ pub enum TemplateKind {
 }
 
 impl TemplateKind {
-    pub const ALL: [TemplateKind; 5] = [
+    pub const ALL: [TemplateKind; 7] = [
         TemplateKind::MultiStoryBuilding,
+        TemplateKind::CompositeSlabOnBeams,
+        TemplateKind::SimplySupportedPlate,
         TemplateKind::TiedArchBridge,
         TemplateKind::PitchedPortalFrame,
         TemplateKind::CrankedCantilever3D,
@@ -25,6 +29,8 @@ impl TemplateKind {
     pub fn title(self) -> &'static str {
         match self {
             TemplateKind::MultiStoryBuilding => "3D Braced Multi-Story Steel Frame",
+            TemplateKind::CompositeSlabOnBeams => "3D Concrete Floor Slab on Steel Beams (Shell + Beam)",
+            TemplateKind::SimplySupportedPlate => "2D Simply Supported Square Plate (Navier Benchmark)",
             TemplateKind::TiedArchBridge => "3D Tied-Arch Pedestrian Bridge",
             TemplateKind::PitchedPortalFrame => "Pitched Roof Portal Frame (Snow + Wind)",
             TemplateKind::CrankedCantilever3D => "3D L-Cantilever (Coupled Bending & Torsion)",
@@ -35,6 +41,8 @@ impl TemplateKind {
     pub fn build(self) -> StructuralModel {
         match self {
             TemplateKind::MultiStoryBuilding => multi_story_building(),
+            TemplateKind::CompositeSlabOnBeams => composite_slab_on_beams(),
+            TemplateKind::SimplySupportedPlate => simply_supported_plate(),
             TemplateKind::TiedArchBridge => tied_arch_bridge(),
             TemplateKind::PitchedPortalFrame => pitched_portal_frame(),
             TemplateKind::CrankedCantilever3D => cranked_cantilever_3d(),
@@ -81,8 +89,10 @@ pub fn multi_story_building() -> StructuralModel {
             },
         ],
         elements: Vec::new(),
+        shells: Vec::new(),
         nodal_loads: Vec::new(),
         distributed_loads: Vec::new(),
+        surface_loads: Vec::new(),
         gravity: GravitySettings {
             enabled: true,
             acceleration: [0.0, 0.0, -9.80665],
@@ -242,8 +252,10 @@ pub fn tied_arch_bridge() -> StructuralModel {
             },
         ],
         elements: Vec::new(),
+        shells: Vec::new(),
         nodal_loads: Vec::new(),
         distributed_loads: Vec::new(),
+        surface_loads: Vec::new(),
         gravity: GravitySettings {
             enabled: true,
             acceleration: [0.0, 0.0, -9.80665],
@@ -377,8 +389,10 @@ pub fn pitched_portal_frame() -> StructuralModel {
             },
         }],
         elements: Vec::new(),
+        shells: Vec::new(),
         nodal_loads: Vec::new(),
         distributed_loads: Vec::new(),
+        surface_loads: Vec::new(),
         gravity: GravitySettings {
             enabled: true,
             acceleration: [0.0, 0.0, -9.80665],
@@ -451,8 +465,10 @@ pub fn cranked_cantilever_3d() -> StructuralModel {
             },
         }],
         elements: Vec::new(),
+        shells: Vec::new(),
         nodal_loads: Vec::new(),
         distributed_loads: Vec::new(),
+        surface_loads: Vec::new(),
         gravity: GravitySettings {
             enabled: true,
             acceleration: [0.0, 0.0, -9.80665],
@@ -500,8 +516,10 @@ pub fn cantilever_benchmark() -> StructuralModel {
             },
         }],
         elements: Vec::new(),
+        shells: Vec::new(),
         nodal_loads: Vec::new(),
         distributed_loads: Vec::new(),
+        surface_loads: Vec::new(),
         gravity: GravitySettings {
             enabled: false,
             acceleration: [0.0, 0.0, -9.80665],
@@ -521,6 +539,161 @@ pub fn cantilever_benchmark() -> StructuralModel {
         forces: [0.0, 0.0, -100_000.0],
         moments: [0.0; 3],
     });
+
+    m
+}
+
+/// 6 m × 5 m Concrete C30 floor slab (6×5 Quad4 Mindlin shells, t = 180 mm)
+/// supported on perimeter IPE 330 steel girders + 4 HEB 260 columns with -8 kN/m² uniform 2D surface load.
+pub fn composite_slab_on_beams() -> StructuralModel {
+    let mut m = StructuralModel {
+        name: "3D Concrete Floor Slab on Steel Beams".to_string(),
+        description: "6 m × 5 m concrete slab (30 Quad4 Mindlin-Reissner shell elements, t = 180 mm) coupled to perimeter IPE 330 steel beams and 4 HEB 260 columns with -8 kN/m² uniform 2D surface live load + self-weight.".to_string(),
+        nodes: Vec::new(),
+        materials: vec![
+            Material::structural_steel_s355(1),
+            Material::concrete_c30(2),
+        ],
+        sections: vec![
+            CrossSection {
+                id: 1,
+                name: "HEB 260 (Column)".to_string(),
+                profile: SectionProfile::IBeam {
+                    depth: 0.260,
+                    width: 0.260,
+                    web_thickness: 0.010,
+                    flange_thickness: 0.0175,
+                },
+            },
+            CrossSection {
+                id: 2,
+                name: "IPE 330 (Edge Girder)".to_string(),
+                profile: SectionProfile::IBeam {
+                    depth: 0.330,
+                    width: 0.160,
+                    web_thickness: 0.0075,
+                    flange_thickness: 0.0115,
+                },
+            },
+        ],
+        elements: Vec::new(),
+        shells: Vec::new(),
+        nodal_loads: Vec::new(),
+        distributed_loads: Vec::new(),
+        surface_loads: Vec::new(),
+        gravity: GravitySettings {
+            enabled: true,
+            acceleration: [0.0, 0.0, -9.80665],
+        },
+    };
+
+    let lx = 6.0;
+    let ly = 5.0;
+    let h = 3.5;
+    let nx = 6usize;
+    let ny = 5usize;
+
+    // 1. Generate 6×5 Quad4 concrete floor slab at Z = h with -8 kN/m² surface live load
+    let corners = [
+        [0.0, 0.0, h],
+        [lx, 0.0, h],
+        [lx, ly, h],
+        [0.0, ly, h],
+    ];
+    m.add_shell_mesh_quad(
+        corners,
+        nx,
+        ny,
+        2, // Concrete C30
+        0.180,
+        Some((LoadCoordSystem::Global, [0.0, 0.0, -8_000.0])),
+    );
+
+    // 2. Connect perimeter IPE 330 steel girders directly along the slab's shared boundary nodes
+    for i in 0..nx {
+        let x0 = lx * (i as f64 / nx as f64);
+        let x1 = lx * ((i + 1) as f64 / nx as f64);
+        // Bottom Y=0 edge
+        let a = m.find_or_add_node([x0, 0.0, h], 1e-3);
+        let b = m.find_or_add_node([x1, 0.0, h], 1e-3);
+        m.add_beam(a, b, 1, 2);
+        // Top Y=ly edge
+        let c = m.find_or_add_node([x0, ly, h], 1e-3);
+        let d = m.find_or_add_node([x1, ly, h], 1e-3);
+        m.add_beam(c, d, 1, 2);
+    }
+    for j in 0..ny {
+        let y0 = ly * (j as f64 / ny as f64);
+        let y1 = ly * ((j + 1) as f64 / ny as f64);
+        // Left X=0 edge
+        let a = m.find_or_add_node([0.0, y0, h], 1e-3);
+        let b = m.find_or_add_node([0.0, y1, h], 1e-3);
+        m.add_beam(a, b, 1, 2);
+        // Right X=lx edge
+        let c = m.find_or_add_node([lx, y0, h], 1e-3);
+        let d = m.find_or_add_node([lx, y1, h], 1e-3);
+        m.add_beam(c, d, 1, 2);
+    }
+
+    // 3. Add 4 fixed-base HEB 260 steel columns at the corners
+    for &[cx, cy] in &[[0.0, 0.0], [lx, 0.0], [lx, ly], [0.0, ly]] {
+        let base = m.add_node([cx, cy, 0.0]);
+        if let Some(n) = m.get_node_mut(base) {
+            n.restraints = SupportPreset::Fixed.to_restraints().unwrap();
+        }
+        let top = m.find_or_add_node([cx, cy, h], 1e-3);
+        m.add_beam(base, top, 1, 1);
+    }
+
+    m
+}
+
+/// 4 m × 4 m simply supported steel plate (8×8 Quad4 shells, t = 40 mm)
+/// under uniform -10 kN/m² 2D pressure — classic Navier plate benchmark.
+pub fn simply_supported_plate() -> StructuralModel {
+    let mut m = StructuralModel {
+        name: "2D Simply Supported Plate (Navier Benchmark)".to_string(),
+        description: "4 m × 4 m simply supported steel plate (t = 40 mm, 8×8 Quad4 Mindlin shells) under uniform -10 kN/m² 2D surface pressure. Compare center deflection against Navier's analytical w_max = 0.004062·q·a⁴/D.".to_string(),
+        nodes: Vec::new(),
+        materials: vec![Material::structural_steel_s355(1)],
+        sections: Vec::new(),
+        elements: Vec::new(),
+        shells: Vec::new(),
+        nodal_loads: Vec::new(),
+        distributed_loads: Vec::new(),
+        surface_loads: Vec::new(),
+        gravity: GravitySettings {
+            enabled: false,
+            acceleration: [0.0, 0.0, -9.80665],
+        },
+    };
+
+    let a = 4.0;
+    let n = 8usize;
+    m.add_shell_mesh_quad(
+        [[0.0, 0.0, 0.0], [a, 0.0, 0.0], [a, a, 0.0], [0.0, a, 0.0]],
+        n,
+        n,
+        1,
+        0.040,
+        Some((LoadCoordSystem::Global, [0.0, 0.0, -10_000.0])),
+    );
+
+    // Simply supported perimeter: restrain uz along all 4 edges + ux/uy at two corners to prevent in-plane rigid body motion
+    for node in &mut m.nodes {
+        let on_x_edge = node.position[0].abs() < 1e-4 || (node.position[0] - a).abs() < 1e-4;
+        let on_y_edge = node.position[1].abs() < 1e-4 || (node.position[1] - a).abs() < 1e-4;
+        if on_x_edge || on_y_edge {
+            node.restraints[2] = true; // uz = 0
+        }
+        if node.position[0].abs() < 1e-4 && node.position[1].abs() < 1e-4 {
+            node.restraints[0] = true;
+            node.restraints[1] = true;
+        }
+        if (node.position[0] - a).abs() < 1e-4 && node.position[1].abs() < 1e-4 {
+            node.restraints[1] = true;
+        }
+    }
 
     m
 }

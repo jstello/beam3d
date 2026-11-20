@@ -1,6 +1,7 @@
 pub mod element;
 pub mod model;
 pub mod section;
+pub mod shell;
 pub mod solver;
 pub mod templates;
 
@@ -10,9 +11,11 @@ mod tests;
 pub use element::{ElementFrame, StationSample};
 pub use model::{
     BeamElement, BeamFormulation, DistributedLoad, GravitySettings, LoadCoordSystem, Material,
-    NodalLoad, Node, Restraints, StructuralModel, SupportPreset,
+    NodalLoad, Node, Restraints, ShellElement, ShellNodes, StructuralModel, SupportPreset,
+    SurfaceLoad,
 };
 pub use section::{CrossSection, ProfileEdge2D, SectionProfile, SectionProperties};
+pub use shell::{ShellFrame, ShellResult};
 pub use solver::{
     AnalysisSummary, ElementResult, NodeResult, Solution, SolverConfig, SolverError,
     solve_linear_static, solve_linear_static_with_config,

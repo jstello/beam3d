@@ -228,6 +228,111 @@ fn test_3d_cranked_l_cantilever_coupled_bending_torsion() {
 }
 
 #[test]
+fn test_shell_membrane_patch_quad4_and_tri3() {
+    // 2 m x 1 m plate under uniform uniaxial tension sigma_xx = 10 MPa (t = 0.01 m)
+    let e = 210.0e9;
+    let nu = 0.3;
+    let g = e / (2.0 * (1.0 + nu));
+    let t = 0.01;
+    let sigma = 10.0e6;
+    let lx = 2.0;
+    let ly = 1.0;
+
+    for use_tri in [false, true] {
+        let mut m = StructuralModel::default();
+        m.materials = vec![Material {
+            id: 1,
+            name: "Steel".to_string(),
+            e,
+            g,
+            density: 7850.0,
+            yield_strength: 355e6,
+        }];
+        let n1 = m.add_node([0.0, 0.0, 0.0]);
+        let n2 = m.add_node([lx, 0.0, 0.0]);
+        let n3 = m.add_node([lx, ly, 0.0]);
+        let n4 = m.add_node([0.0, ly, 0.0]);
+
+        // Restrain ux at x=0, uy at (0,0), uz/rx/ry everywhere on plane
+        m.get_node_mut(n1).unwrap().restraints = [true, true, true, true, true, false];
+        m.get_node_mut(n4).unwrap().restraints = [true, false, true, true, true, false];
+        m.get_node_mut(n2).unwrap().restraints = [false, false, true, true, true, false];
+        m.get_node_mut(n3).unwrap().restraints = [false, false, true, true, true, false];
+
+        if use_tri {
+            m.add_shell_tri([n1, n2, n3], 1, t);
+            m.add_shell_tri([n1, n3, n4], 1, t);
+        } else {
+            m.add_shell_quad([n1, n2, n3, n4], 1, t);
+        }
+
+        // Uniform edge traction F_total = sigma * t * ly split equally between n2 and n3
+        let f_half = 0.5 * sigma * t * ly;
+        m.nodal_loads.push(NodalLoad {
+            id: 1,
+            node_id: n2,
+            forces: [f_half, 0.0, 0.0],
+            moments: [0.0; 3],
+        });
+        m.nodal_loads.push(NodalLoad {
+            id: 2,
+            node_id: n3,
+            forces: [f_half, 0.0, 0.0],
+            moments: [0.0; 3],
+        });
+
+        let sol = solve_linear_static(&m).expect("membrane patch solve");
+        let expected_ux = (sigma / e) * lx;
+        let expected_uy = -nu * (sigma / e) * ly;
+
+        assert_rel_close(
+            sol.node_results[&n2].displacements[0],
+            expected_ux,
+            1e-9,
+            "Membrane ux",
+        );
+        assert_rel_close(
+            sol.node_results[&n4].displacements[1],
+            expected_uy,
+            1e-9,
+            "Membrane Poisson uy",
+        );
+        for sr in sol.shell_results.values() {
+            assert_rel_close(sr.max_von_mises_pa, sigma, 1e-8, "Membrane von Mises stress");
+        }
+    }
+}
+
+#[test]
+fn test_simply_supported_square_plate_navier_benchmark() {
+    // 4 m x 4 m simply supported steel plate (t = 40 mm), 8x8 Quad4 mesh, q = -10 kN/m^2
+    // Analytical Navier thin-plate series: w_max = 0.00406235 * q * a^4 / D
+    let model = TemplateKind::SimplySupportedPlate.build();
+    let sol = solve_linear_static(&model).expect("plate benchmark solve");
+
+    let a = 4.0_f64;
+    let t = 0.040_f64;
+    let q = 10_000.0_f64;
+    let mat = &model.materials[0];
+    let nu = mat.poisson_ratio();
+    let d_flex = (mat.e * t.powi(3)) / (12.0 * (1.0 - nu * nu));
+    let expected_w_navier = 0.00406235 * q * a.powi(4) / d_flex;
+
+    // 8x8 Q4-SRI Mindlin plate matches Kirchhoff Navier thin-plate solution within ~1.5%
+    assert_rel_close(
+        sol.summary.max_displacement_m,
+        expected_w_navier,
+        0.02,
+        "Navier simply supported plate center deflection",
+    );
+    assert!(
+        sol.summary.force_equilibrium_residual_n < 1e-6,
+        "Plate vertical equilibrium residual too high: {}",
+        sol.summary.force_equilibrium_residual_n
+    );
+}
+
+#[test]
 fn test_all_templates_solve_and_satisfy_equilibrium() {
     for kind in TemplateKind::ALL {
         let model = kind.build();

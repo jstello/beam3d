@@ -71,8 +71,11 @@ mod tests {
                     hovered_node: None,
                     selected_element: parsed.elements.first().map(|e| e.id),
                     hovered_element: None,
+                    selected_shell: parsed.shells.first().map(|s| s.id),
+                    hovered_shell: None,
                     preview_point: Some([1.0, 2.0, 1.5]),
                     beam_draw_start_node: parsed.nodes.first().map(|n| n.id),
+                    shell_draw_points: Vec::new(),
                 };
                 build_scene_geometry(&parsed, Some(&sol), &opts, &mut scene);
                 assert!(!scene.opaque_tris.is_empty());
@@ -101,8 +104,11 @@ mod tests {
                         hovered_node: None,
                         selected_element: parsed.elements.first().map(|e| e.id),
                         hovered_element: None,
+                        selected_shell: parsed.shells.first().map(|s| s.id),
+                        hovered_shell: None,
                         preview_point: Some([1.0, 2.0, 0.0]),
                         beam_draw_start_node: parsed.nodes.first().map(|n| n.id),
+                        shell_draw_points: Vec::new(),
                     };
                     build_scene_geometry(&parsed, Some(&sol), &opts, &mut scene);
                     assert!(!scene.opaque_tris.is_empty());
@@ -187,8 +193,11 @@ mod tests {
             hovered_node: None,
             selected_element: Some(1),
             hovered_element: None,
+            selected_shell: None,
+            hovered_shell: None,
             preview_point: None,
             beam_draw_start_node: None,
+            shell_draw_points: Vec::new(),
         };
         build_scene_geometry(&model, Some(&sol), &opts, &mut scene);
 

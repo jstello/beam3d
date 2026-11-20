@@ -198,6 +198,131 @@ fn draw_structure_tab(app: &mut Beam3dApp, ui: &mut egui::Ui) {
             app.mark_model_changed();
         }
     });
+
+    ui.add_space(6.0);
+    egui::CollapsingHeader::new(
+        RichText::new(format!("2D Shells / Surfaces ({})", app.model.shells.len())).strong(),
+    )
+    .default_open(!app.model.shells.is_empty())
+    .show(ui, |ui| {
+        ui.label(
+            RichText::new("Quick 2D Rectangular Slab / Wall Generator")
+                .small()
+                .color(Color32::from_gray(175)),
+        );
+        ui.horizontal(|ui| {
+            ui.label("X:");
+            ui.add(egui::DragValue::new(&mut app.panel_gen_bounds[0]).speed(0.5).suffix("m"));
+            ui.label("..");
+            ui.add(egui::DragValue::new(&mut app.panel_gen_bounds[1]).speed(0.5).suffix("m"));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Y:");
+            ui.add(egui::DragValue::new(&mut app.panel_gen_bounds[2]).speed(0.5).suffix("m"));
+            ui.label("..");
+            ui.add(egui::DragValue::new(&mut app.panel_gen_bounds[3]).speed(0.5).suffix("m"));
+            ui.label("Z:");
+            ui.add(egui::DragValue::new(&mut app.panel_gen_bounds[4]).speed(0.25).suffix("m"));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Mesh:");
+            ui.add(egui::DragValue::new(&mut app.new_shell_nx).range(1..=20));
+            ui.label("×");
+            ui.add(egui::DragValue::new(&mut app.new_shell_ny).range(1..=20));
+            ui.label("t:");
+            ui.add(
+                egui::DragValue::new(&mut app.new_shell_thickness_mm)
+                    .speed(5.0)
+                    .range(2.0..=2000.0)
+                    .suffix("mm"),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut app.new_shell_apply_load, "Surface qz:");
+            if app.new_shell_apply_load {
+                ui.add(
+                    egui::DragValue::new(&mut app.new_shell_pressure_kpa)
+                        .speed(0.5)
+                        .suffix(" kN/m²"),
+                );
+            }
+        });
+        if ui.button("+ Generate 2D Shell Panel").clicked() {
+            let [x0, x1, y0, y1, z] = app.panel_gen_bounds;
+            if (x1 - x0).abs() > 1e-3 && (y1 - y0).abs() > 1e-3 {
+                let mat_id = app.model.materials.last().map(|m| m.id).unwrap_or(1);
+                let load_opt = if app.new_shell_apply_load && app.new_shell_pressure_kpa.abs() > 1e-6
+                {
+                    Some((
+                        LoadCoordSystem::Global,
+                        [0.0, 0.0, app.new_shell_pressure_kpa * 1e3],
+                    ))
+                } else {
+                    None
+                };
+                app.push_undo();
+                let created = app.model.add_shell_mesh_quad(
+                    [[x0, y0, z], [x1, y0, z], [x1, y1, z], [x0, y1, z]],
+                    app.new_shell_nx,
+                    app.new_shell_ny,
+                    mat_id,
+                    app.new_shell_thickness_mm * 1e-3,
+                    load_opt,
+                );
+                app.selected_shell = created.first().copied();
+                app.selected_node = None;
+                app.selected_element = None;
+                app.mark_model_changed();
+            }
+        }
+
+        ui.add_space(4.0);
+        let mut delete_shell = None;
+        egui::ScrollArea::vertical()
+            .id_salt("shells_list_scroll")
+            .max_height(180.0)
+            .show(ui, |ui| {
+                for sh in &app.model.shells {
+                    let is_sel = app.selected_shell == Some(sh.id);
+                    let kind_str = if sh.nodes.as_slice().len() == 3 {
+                        "Tri3"
+                    } else {
+                        "Quad4"
+                    };
+                    let has_load = app.model.surface_loads.iter().any(|l| l.shell_id == sh.id);
+                    let load_tag = if has_load { " [p]" } else { "" };
+                    ui.horizontal(|ui| {
+                        let txt = format!(
+                            "S{:<2} {} t={:.0}mm{}",
+                            sh.id,
+                            kind_str,
+                            sh.thickness * 1e3,
+                            load_tag
+                        );
+                        if ui
+                            .selectable_label(is_sel, RichText::new(txt).monospace().size(11.5))
+                            .clicked()
+                        {
+                            app.selected_shell = Some(sh.id);
+                            app.selected_node = None;
+                            app.selected_element = None;
+                        }
+                        if ui.small_button("✕").on_hover_text("Delete Shell").clicked() {
+                            delete_shell = Some(sh.id);
+                        }
+                    });
+                }
+            });
+
+        if let Some(sid) = delete_shell {
+            app.push_undo();
+            app.model.remove_shell(sid);
+            if app.selected_shell == Some(sid) {
+                app.selected_shell = None;
+            }
+            app.mark_model_changed();
+        }
+    });
 }
 
 fn draw_sections_tab(app: &mut Beam3dApp, ui: &mut egui::Ui) {
@@ -780,6 +905,121 @@ fn draw_loads_tab(app: &mut Beam3dApp, ui: &mut egui::Ui) {
         changed = true;
     }
 
+    ui.separator();
+    ui.label(
+        RichText::new(format!(
+            "2D Shell Surface Loads ({})",
+            app.model.surface_loads.len()
+        ))
+        .strong()
+        .color(Color32::from_rgb(130, 220, 240)),
+    );
+
+    // One-click Bulk 2D Distributed Surface Pressure Card
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Coord:").small());
+            egui::ComboBox::from_id_salt("bulk_sload_cs")
+                .selected_text(match app.bulk_sload_coord {
+                    LoadCoordSystem::Global => "Global (X,Y,Z)",
+                    LoadCoordSystem::Local => "Local (Normal z)",
+                })
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut app.bulk_sload_coord,
+                        LoadCoordSystem::Global,
+                        "Global (X,Y,Z)",
+                    );
+                    ui.selectable_value(
+                        &mut app.bulk_sload_coord,
+                        LoadCoordSystem::Local,
+                        "Local (Normal z)",
+                    );
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label("p (kN/m²):");
+            for (idx, pfx) in [(0, "x:"), (1, "y:"), (2, "z:")] {
+                ui.add(
+                    egui::DragValue::new(&mut app.bulk_sload_kpa[idx])
+                        .speed(0.5)
+                        .prefix(pfx),
+                );
+            }
+        });
+        let p_pa = [
+            app.bulk_sload_kpa[0] * 1e3,
+            app.bulk_sload_kpa[1] * 1e3,
+            app.bulk_sload_kpa[2] * 1e3,
+        ];
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !app.model.shells.is_empty(),
+                    egui::Button::new(format!("✓ Apply to All Shells ({})", app.model.shells.len())),
+                )
+                .clicked()
+            {
+                app.push_undo();
+                let all_ids: Vec<usize> = app.model.shells.iter().map(|s| s.id).collect();
+                app.model
+                    .apply_surface_load_to_shells(&all_ids, app.bulk_sload_coord, p_pa, true);
+                changed = true;
+            }
+            if let Some(sid) = app.selected_shell {
+                if ui.button("Apply to Coplanar Surface").clicked() {
+                    app.push_undo();
+                    let ids = app.model.coplanar_shell_ids(sid);
+                    app.model
+                        .apply_surface_load_to_shells(&ids, app.bulk_sload_coord, p_pa, true);
+                    changed = true;
+                }
+            }
+            if !app.model.surface_loads.is_empty() && ui.small_button("Clear 2D Loads").clicked() {
+                app.push_undo();
+                app.model.surface_loads.clear();
+                changed = true;
+            }
+        });
+    });
+
+    let mut del_sl = None;
+    if !app.model.surface_loads.is_empty() {
+        egui::ScrollArea::vertical()
+            .id_salt("sloads_scroll")
+            .max_height(160.0)
+            .show(ui, |ui| {
+                for sl in &mut app.model.surface_loads {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "S{:<2} ({}): ({:+.1}, {:+.1}, {:+.1}) kN/m²",
+                                sl.shell_id,
+                                match sl.coord_system {
+                                    LoadCoordSystem::Global => "G",
+                                    LoadCoordSystem::Local => "L",
+                                },
+                                sl.pressure[0] * 1e-3,
+                                sl.pressure[1] * 1e-3,
+                                sl.pressure[2] * 1e-3,
+                            ))
+                            .monospace()
+                            .small(),
+                        );
+                        if ui.small_button("✕").clicked() {
+                            del_sl = Some(sl.id);
+                        }
+                    });
+                }
+            });
+    }
+    if let Some(id) = del_sl {
+        app.push_undo();
+        app.model.surface_loads.retain(|l| l.id != id);
+        changed = true;
+    }
+
     if changed {
         app.mark_model_changed();
     }
@@ -979,12 +1219,197 @@ fn draw_selection_inspector(app: &mut Beam3dApp, ui: &mut egui::Ui) {
         draw_node_inspector(app, ui, nid);
     } else if let Some(eid) = app.selected_element {
         draw_element_inspector(app, ui, eid);
+    } else if let Some(sid) = app.selected_shell {
+        draw_shell_inspector(app, ui, sid);
     } else {
         ui.label(
-            RichText::new("Click any node or beam in the 3D viewport (or left tree) to inspect and edit its properties, hinges, cross-section, and internal forces.")
+            RichText::new("Click any node, beam, or 2D shell in the 3D viewport (or left tree) to inspect and edit its properties, hinges, thickness, surface loads, and internal forces.")
                 .small()
                 .color(Color32::from_gray(155)),
         );
+    }
+}
+
+fn draw_shell_inspector(app: &mut Beam3dApp, ui: &mut egui::Ui, sid: usize) {
+    let Some(shell_clone) = app.model.get_shell(sid).cloned() else {
+        app.selected_shell = None;
+        return;
+    };
+
+    let materials: Vec<(usize, String)> = app
+        .model
+        .materials
+        .iter()
+        .map(|m| (m.id, m.name.clone()))
+        .collect();
+
+    let mut changed = false;
+    let mut apply_props_coplanar = false;
+    let mut apply_load_single = false;
+    let mut apply_load_coplanar = false;
+
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        let kind_str = if shell_clone.nodes.as_slice().len() == 3 {
+            "Tri3"
+        } else {
+            "Quad4"
+        };
+        ui.label(
+            RichText::new(format!(
+                "2D Shell S{} ({}, nodes {:?})",
+                sid,
+                kind_str,
+                shell_clone.nodes.as_slice()
+            ))
+            .strong(),
+        );
+
+        if let Some(sh) = app.model.get_shell_mut(sid) {
+            let mut t_mm = sh.thickness * 1e3;
+            ui.horizontal(|ui| {
+                ui.label("Thickness t:");
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut t_mm)
+                            .speed(5.0)
+                            .range(1.0..=2000.0)
+                            .suffix(" mm"),
+                    )
+                    .changed()
+                {
+                    sh.thickness = t_mm * 1e-3;
+                    changed = true;
+                }
+            });
+
+            egui::ComboBox::from_label("Material")
+                .selected_text(
+                    materials
+                        .iter()
+                        .find(|(id, _)| *id == sh.material_id)
+                        .map(|(_, n)| n.as_str())
+                        .unwrap_or("?"),
+                )
+                .show_ui(ui, |ui| {
+                    for (id, name) in &materials {
+                        changed |= ui.selectable_value(&mut sh.material_id, *id, name).changed();
+                    }
+                });
+        }
+
+        if ui
+            .small_button("Apply Thickness & Mat to Entire Coplanar Surface")
+            .clicked()
+        {
+            apply_props_coplanar = true;
+        }
+
+        ui.separator();
+        ui.label(
+            RichText::new("Quick 2D Surface Pressure (kN/m²)")
+                .strong()
+                .small()
+                .color(Color32::from_rgb(130, 220, 240)),
+        );
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("insp_sload_cs")
+                .selected_text(match app.bulk_sload_coord {
+                    LoadCoordSystem::Global => "Global",
+                    LoadCoordSystem::Local => "Local Normal",
+                })
+                .width(105.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut app.bulk_sload_coord, LoadCoordSystem::Global, "Global");
+                    ui.selectable_value(
+                        &mut app.bulk_sload_coord,
+                        LoadCoordSystem::Local,
+                        "Local Normal",
+                    );
+                });
+            for (idx, pfx) in [(0, "x:"), (1, "y:"), (2, "z:")] {
+                ui.add(
+                    egui::DragValue::new(&mut app.bulk_sload_kpa[idx])
+                        .speed(0.5)
+                        .prefix(pfx),
+                );
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .small_button(format!("Apply to S{sid}"))
+                .on_hover_text("Apply to this shell element only")
+                .clicked()
+            {
+                apply_load_single = true;
+            }
+            if ui
+                .small_button("✓ Apply to Coplanar Slab/Wall")
+                .on_hover_text("Apply uniformly to all shells sharing this 3D plane")
+                .clicked()
+            {
+                apply_load_coplanar = true;
+            }
+        });
+
+        if let Some(sr) = app.solution.as_ref().and_then(|s| s.shell_results.get(&sid)) {
+            ui.separator();
+            ui.label(
+                RichText::new(format!(
+                    "Area A     = {:.3} m²\nCentroid |u| = {:.3} mm\nMembrane N = ({:+.1}, {:+.1}, {:+.1}) kN/m\nMoments M  = ({:+.2}, {:+.2}, {:+.2}) kN·m/m\nShears  V  = ({:+.1}, {:+.1}) kN/m\nVon Mises  = {:.2} MPa ({:.1}%)",
+                    sr.area,
+                    sr.centroid_disp_mag_m * 1e3,
+                    sr.membrane_forces[0] * 1e-3,
+                    sr.membrane_forces[1] * 1e-3,
+                    sr.membrane_forces[2] * 1e-3,
+                    sr.bending_moments[0] * 1e-3,
+                    sr.bending_moments[1] * 1e-3,
+                    sr.bending_moments[2] * 1e-3,
+                    sr.transverse_shears[0] * 1e-3,
+                    sr.transverse_shears[1] * 1e-3,
+                    sr.max_von_mises_pa * 1e-6,
+                    sr.utilization * 100.0,
+                ))
+                .monospace()
+                .small(),
+            );
+        }
+    });
+
+    if apply_props_coplanar {
+        if let Some(cur) = app.model.get_shell(sid).cloned() {
+            app.push_undo();
+            let ids = app.model.coplanar_shell_ids(sid);
+            for id in ids {
+                if let Some(s) = app.model.get_shell_mut(id) {
+                    s.thickness = cur.thickness;
+                    s.material_id = cur.material_id;
+                }
+            }
+            changed = true;
+        }
+    }
+
+    let p_pa = [
+        app.bulk_sload_kpa[0] * 1e3,
+        app.bulk_sload_kpa[1] * 1e3,
+        app.bulk_sload_kpa[2] * 1e3,
+    ];
+    if apply_load_single {
+        app.push_undo();
+        app.model
+            .apply_surface_load_to_shells(&[sid], app.bulk_sload_coord, p_pa, true);
+        changed = true;
+    }
+    if apply_load_coplanar {
+        app.push_undo();
+        let ids = app.model.coplanar_shell_ids(sid);
+        app.model
+            .apply_surface_load_to_shells(&ids, app.bulk_sload_coord, p_pa, true);
+        changed = true;
+    }
+
+    if changed {
+        app.mark_model_changed();
     }
 }
 

@@ -121,6 +121,15 @@ impl Material {
             yield_strength: 30.0e6,
         }
     }
+
+    /// Isotropic Poisson's ratio derived from Young's modulus E and shear modulus G.
+    pub fn poisson_ratio(&self) -> f64 {
+        if self.g > 1e-6 {
+            (self.e / (2.0 * self.g) - 1.0).clamp(0.0, 0.49)
+        } else {
+            0.3
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +224,60 @@ pub struct DistributedLoad {
     pub q_end: [f64; 3],
 }
 
+/// Node connectivity of a 2D flat shell / surface finite element.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ShellNodes {
+    Tri([usize; 3]),
+    Quad([usize; 4]),
+}
+
+impl ShellNodes {
+    pub fn as_slice(&self) -> &[usize] {
+        match self {
+            ShellNodes::Tri(a) => a,
+            ShellNodes::Quad(a) => a,
+        }
+    }
+
+    pub fn contains(&self, node_id: usize) -> bool {
+        self.as_slice().contains(&node_id)
+    }
+}
+
+/// 2D Mindlin–Reissner + Plane-Stress flat 3D shell / surface finite element (Tri3 or Quad4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ShellElement {
+    pub id: usize,
+    pub label: String,
+    pub nodes: ShellNodes,
+    pub material_id: usize,
+    /// Constant shell thickness `t` in meters.
+    pub thickness: f64,
+}
+
+impl ShellElement {
+    pub fn new(id: usize, nodes: ShellNodes, material_id: usize, thickness: f64) -> Self {
+        Self {
+            id,
+            label: format!("S{id}"),
+            nodes,
+            material_id,
+            thickness: thickness.max(1e-4),
+        }
+    }
+}
+
+/// 2D distributed surface traction / pressure load applied over a shell element's area.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SurfaceLoad {
+    pub id: usize,
+    pub shell_id: usize,
+    pub coord_system: LoadCoordSystem,
+    /// Surface traction / pressure `[px, py, pz]` in Pa (N/m²).
+    /// In `Local` coordinates, `pz` acts along the shell's outward surface normal.
+    pub pressure: [f64; 3],
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GravitySettings {
     pub enabled: bool,
@@ -231,7 +294,7 @@ impl Default for GravitySettings {
     }
 }
 
-/// Complete 3D frame model ready for serialization, interactive editing, and FEA solving.
+/// Complete 3D structural model (beams + 2D shells) ready for serialization, interactive editing, and FEA solving.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StructuralModel {
     pub name: String,
@@ -240,18 +303,25 @@ pub struct StructuralModel {
     pub materials: Vec<Material>,
     pub sections: Vec<CrossSection>,
     pub elements: Vec<BeamElement>,
+    #[serde(default)]
+    pub shells: Vec<ShellElement>,
     pub nodal_loads: Vec<NodalLoad>,
     pub distributed_loads: Vec<DistributedLoad>,
+    #[serde(default)]
+    pub surface_loads: Vec<SurfaceLoad>,
     pub gravity: GravitySettings,
 }
 
 impl Default for StructuralModel {
     fn default() -> Self {
         Self {
-            name: "Untitled 3D Frame".to_string(),
+            name: "Untitled 3D Structure".to_string(),
             description: String::new(),
             nodes: Vec::new(),
-            materials: vec![Material::structural_steel_s355(1)],
+            materials: vec![
+                Material::structural_steel_s355(1),
+                Material::concrete_c30(2),
+            ],
             sections: vec![CrossSection {
                 id: 1,
                 name: "IPE 300".to_string(),
@@ -263,8 +333,10 @@ impl Default for StructuralModel {
                 },
             }],
             elements: Vec::new(),
+            shells: Vec::new(),
             nodal_loads: Vec::new(),
             distributed_loads: Vec::new(),
+            surface_loads: Vec::new(),
             gravity: GravitySettings::default(),
         }
     }
@@ -373,15 +445,217 @@ impl StructuralModel {
             .collect();
         self.elements
             .retain(|e| e.node_i != node_id && e.node_j != node_id);
+
+        let removed_shells: Vec<usize> = self
+            .shells
+            .iter()
+            .filter(|s| s.nodes.contains(node_id))
+            .map(|s| s.id)
+            .collect();
+        self.shells.retain(|s| !s.nodes.contains(node_id));
+
         self.nodal_loads.retain(|l| l.node_id != node_id);
         self.distributed_loads
             .retain(|l| !removed_elements.contains(&l.element_id));
+        self.surface_loads
+            .retain(|l| !removed_shells.contains(&l.shell_id));
     }
 
     pub fn remove_element(&mut self, element_id: usize) {
         self.elements.retain(|e| e.id != element_id);
         self.distributed_loads
             .retain(|l| l.element_id != element_id);
+    }
+
+    pub fn next_shell_id(&self) -> usize {
+        self.shells.iter().map(|s| s.id).max().unwrap_or(0) + 1
+    }
+
+    pub fn next_surface_load_id(&self) -> usize {
+        self.surface_loads.iter().map(|l| l.id).max().unwrap_or(0) + 1
+    }
+
+    pub fn get_shell(&self, id: usize) -> Option<&ShellElement> {
+        self.shells.iter().find(|s| s.id == id)
+    }
+
+    pub fn get_shell_mut(&mut self, id: usize) -> Option<&mut ShellElement> {
+        self.shells.iter_mut().find(|s| s.id == id)
+    }
+
+    pub fn add_shell_tri(
+        &mut self,
+        nodes: [usize; 3],
+        material_id: usize,
+        thickness: f64,
+    ) -> Option<usize> {
+        if nodes[0] == nodes[1] || nodes[1] == nodes[2] || nodes[2] == nodes[0] {
+            return None;
+        }
+        if nodes.iter().any(|&nid| self.get_node(nid).is_none()) {
+            return None;
+        }
+        let id = self.next_shell_id();
+        self.shells
+            .push(ShellElement::new(id, ShellNodes::Tri(nodes), material_id, thickness));
+        Some(id)
+    }
+
+    pub fn add_shell_quad(
+        &mut self,
+        nodes: [usize; 4],
+        material_id: usize,
+        thickness: f64,
+    ) -> Option<usize> {
+        for i in 0..4 {
+            for j in (i + 1)..4 {
+                if nodes[i] == nodes[j] {
+                    return None;
+                }
+            }
+        }
+        if nodes.iter().any(|&nid| self.get_node(nid).is_none()) {
+            return None;
+        }
+        let id = self.next_shell_id();
+        self.shells
+            .push(ShellElement::new(id, ShellNodes::Quad(nodes), material_id, thickness));
+        Some(id)
+    }
+
+    pub fn remove_shell(&mut self, shell_id: usize) {
+        self.shells.retain(|s| s.id != shell_id);
+        self.surface_loads.retain(|l| l.shell_id != shell_id);
+    }
+
+    /// Generates an `nx × ny` structured Quad4 2D shell mesh spanning 4 ordered 3D corners
+    /// `[p0, p1, p2, p3]` (CCW around the quad), merging boundary vertices with existing nodes.
+    /// Optionally attaches a uniform 2D surface pressure load to every generated shell element.
+    pub fn add_shell_mesh_quad(
+        &mut self,
+        corners: [[f64; 3]; 4],
+        nx: usize,
+        ny: usize,
+        material_id: usize,
+        thickness: f64,
+        initial_pressure: Option<(LoadCoordSystem, [f64; 3])>,
+    ) -> Vec<usize> {
+        let nx = nx.clamp(1, 40);
+        let ny = ny.clamp(1, 40);
+        let [p0, p1, p2, p3] = corners;
+
+        let mut grid = vec![vec![0usize; nx + 1]; ny + 1];
+        for j in 0..=ny {
+            let v = j as f64 / ny as f64;
+            for i in 0..=nx {
+                let u = i as f64 / nx as f64;
+                let w0 = (1.0 - u) * (1.0 - v);
+                let w1 = u * (1.0 - v);
+                let w2 = u * v;
+                let w3 = (1.0 - u) * v;
+                let pos = [
+                    w0 * p0[0] + w1 * p1[0] + w2 * p2[0] + w3 * p3[0],
+                    w0 * p0[1] + w1 * p1[1] + w2 * p2[1] + w3 * p3[1],
+                    w0 * p0[2] + w1 * p1[2] + w2 * p2[2] + w3 * p3[2],
+                ];
+                grid[j][i] = self.find_or_add_node(pos, 1e-3);
+            }
+        }
+
+        let mut created = Vec::with_capacity(nx * ny);
+        for j in 0..ny {
+            for i in 0..nx {
+                let n0 = grid[j][i];
+                let n1 = grid[j][i + 1];
+                let n2 = grid[j + 1][i + 1];
+                let n3 = grid[j + 1][i];
+                if let Some(sid) = self.add_shell_quad([n0, n1, n2, n3], material_id, thickness) {
+                    created.push(sid);
+                    if let Some((cs, pressure)) = initial_pressure {
+                        let lid = self.next_surface_load_id();
+                        self.surface_loads.push(SurfaceLoad {
+                            id: lid,
+                            shell_id: sid,
+                            coord_system: cs,
+                            pressure,
+                        });
+                    }
+                }
+            }
+        }
+        created
+    }
+
+    /// Bulk-applies a 2D surface load to a set of shell IDs (optionally replacing existing loads on them).
+    pub fn apply_surface_load_to_shells(
+        &mut self,
+        shell_ids: &[usize],
+        coord_system: LoadCoordSystem,
+        pressure: [f64; 3],
+        replace_existing: bool,
+    ) {
+        if replace_existing {
+            self.surface_loads
+                .retain(|l| !shell_ids.contains(&l.shell_id));
+        }
+        for &sid in shell_ids {
+            let lid = self.next_surface_load_id();
+            self.surface_loads.push(SurfaceLoad {
+                id: lid,
+                shell_id: sid,
+                coord_system,
+                pressure,
+            });
+        }
+    }
+
+    /// Returns all shell IDs coplanar with `seed_shell_id` (same plane normal & plane offset within tolerance).
+    pub fn coplanar_shell_ids(&self, seed_shell_id: usize) -> Vec<usize> {
+        let Some(seed) = self.get_shell(seed_shell_id) else {
+            return Vec::new();
+        };
+        let Some((seed_n, seed_d)) = self.shell_plane(seed) else {
+            return vec![seed_shell_id];
+        };
+
+        self.shells
+            .iter()
+            .filter(|s| {
+                if let Some((n, d)) = self.shell_plane(s) {
+                    let dot = n[0] * seed_n[0] + n[1] * seed_n[1] + n[2] * seed_n[2];
+                    if dot.abs() > 0.995 {
+                        let sign = if dot >= 0.0 { 1.0 } else { -1.0 };
+                        (d * sign - seed_d).abs() < 0.05
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            })
+            .map(|s| s.id)
+            .collect()
+    }
+
+    fn shell_plane(&self, shell: &ShellElement) -> Option<([f64; 3], f64)> {
+        let ids = shell.nodes.as_slice();
+        let p0 = self.get_node(ids[0])?.position;
+        let p1 = self.get_node(ids[1])?.position;
+        let p2 = self.get_node(ids[2])?.position;
+        let u = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+        let v = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+        let c = [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ];
+        let len = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+        if len < 1e-9 {
+            return None;
+        }
+        let n = [c[0] / len, c[1] / len, c[2] / len];
+        let d = n[0] * p0[0] + n[1] * p0[1] + n[2] * p0[2];
+        Some((n, d))
     }
 
     /// Subdivides a beam element into `n_segments` collinear finite elements,

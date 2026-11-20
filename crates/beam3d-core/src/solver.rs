@@ -4,10 +4,14 @@ use crate::element::{
     uncondensed_local_stiffness,
 };
 use crate::model::StructuralModel;
+use crate::shell::{
+    ShellFrame, ShellResult, consistent_global_surface_forces, recover_shell_result,
+    shell_local_stiffness, total_global_surface_traction,
+};
 use faer::linalg::solvers::Solve;
 use faer::sparse::{SparseColMat, Triplet};
 use faer::{Mat, Side};
-use nalgebra::SVector;
+use nalgebra::{DMatrix, DVector, SVector};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -15,7 +19,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error, Clone)]
 pub enum SolverError {
-    #[error("Model has no beam elements.")]
+    #[error("Model has no beam or shell elements.")]
     NoElements,
     #[error("Model has no nodes.")]
     NoNodes,
@@ -99,6 +103,8 @@ pub struct AnalysisSummary {
 pub struct Solution {
     pub node_results: HashMap<usize, NodeResult>,
     pub element_results: HashMap<usize, ElementResult>,
+    #[serde(default)]
+    pub shell_results: HashMap<usize, ShellResult>,
     pub summary: AnalysisSummary,
 }
 
@@ -127,7 +133,7 @@ pub fn solve_linear_static_with_config(
     if model.nodes.is_empty() {
         return Err(SolverError::NoNodes);
     }
-    if model.elements.is_empty() {
+    if model.elements.is_empty() && model.shells.is_empty() {
         return Err(SolverError::NoElements);
     }
 
@@ -156,6 +162,17 @@ pub fn solve_linear_static_with_config(
             })?;
         node_connected[i_idx] = true;
         node_connected[j_idx] = true;
+    }
+    for shell in &model.shells {
+        for &nid in shell.nodes.as_slice() {
+            let &n_idx = node_id_to_idx
+                .get(&nid)
+                .ok_or(SolverError::MissingNode {
+                    element_id: shell.id,
+                    node_id: nid,
+                })?;
+            node_connected[n_idx] = true;
+        }
     }
     for (idx, node) in model.nodes.iter().enumerate() {
         if !node_connected[idx] && node.restraints.iter().any(|&r| !r) {
@@ -364,6 +381,124 @@ pub fn solve_linear_static_with_config(
         });
     }
 
+    // Pre-collect 2D surface loads per shell
+    let mut shell_sloads: HashMap<usize, Vec<_>> = HashMap::new();
+    for sl in &model.surface_loads {
+        shell_sloads
+            .entry(sl.shell_id)
+            .or_default()
+            .push((sl.coord_system, sl.pressure));
+    }
+
+    struct CachedShell {
+        id: usize,
+        node_indices: Vec<usize>,
+        frame: ShellFrame,
+        e: f64,
+        g: f64,
+        nu: f64,
+        fy: f64,
+        thickness: f64,
+        t_mat: DMatrix<f64>,
+        k_global: DMatrix<f64>,
+    }
+
+    let mut cached_shells = Vec::with_capacity(model.shells.len());
+    for shell in &model.shells {
+        let node_ids = shell.nodes.as_slice();
+        let node_indices: Vec<usize> = node_ids.iter().map(|nid| node_id_to_idx[nid]).collect();
+        let positions: Vec<[f64; 3]> = node_indices
+            .iter()
+            .map(|&idx| model.nodes[idx].position)
+            .collect();
+
+        let mat = model
+            .get_material(shell.material_id)
+            .ok_or(SolverError::MissingMaterial {
+                element_id: shell.id,
+                material_id: shell.material_id,
+            })?;
+        let nu = mat.poisson_ratio();
+
+        let frame = ShellFrame::compute(&positions).map_err(|reason| SolverError::InvalidElement {
+            element_id: shell.id,
+            reason,
+        })?;
+        let k_local = shell_local_stiffness(&frame, mat.e, mat.g, nu, shell.thickness).map_err(
+            |reason| SolverError::InvalidElement {
+                element_id: shell.id,
+                reason,
+            },
+        )?;
+        let t_mat = frame.transformation_matrix();
+        let k_global = t_mat.transpose() * &k_local * &t_mat;
+
+        let sloads_slice = shell_sloads
+            .get(&shell.id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let p_global = total_global_surface_traction(
+            &frame,
+            mat.density,
+            shell.thickness,
+            &model.gravity,
+            sloads_slice,
+        );
+        for d in 0..3 {
+            total_applied_force[d] += p_global[d] * frame.area;
+        }
+
+        let f_eq_global = consistent_global_surface_forces(&frame, p_global).map_err(|reason| {
+            SolverError::InvalidElement {
+                element_id: shell.id,
+                reason,
+            }
+        })?;
+
+        let ndof = node_indices.len() * 6;
+        let mut shell_gdofs = Vec::with_capacity(ndof);
+        for &n_idx in &node_indices {
+            for d in 0..6 {
+                shell_gdofs.push(n_idx * 6 + d);
+            }
+        }
+
+        for a in 0..ndof {
+            f_ext_global[shell_gdofs[a]] += f_eq_global[a];
+        }
+
+        for r in 0..ndof {
+            let gr = shell_gdofs[r];
+            if let Some(fr) = dof_to_free[gr] {
+                for c in 0..ndof {
+                    let val = k_global[(r, c)];
+                    if val.abs() == 0.0 {
+                        continue;
+                    }
+                    let gc = shell_gdofs[c];
+                    if let Some(fc) = dof_to_free[gc] {
+                        triplets_ff.push(Triplet::new(fr, fc, val));
+                    } else {
+                        rhs_free[fr] -= val * u_global[gc];
+                    }
+                }
+            }
+        }
+
+        cached_shells.push(CachedShell {
+            id: shell.id,
+            node_indices,
+            frame,
+            e: mat.e,
+            g: mat.g,
+            nu,
+            fy: mat.yield_strength.max(1.0),
+            thickness: shell.thickness,
+            t_mat,
+            k_global,
+        });
+    }
+
     for gdof in 0..total_dofs {
         if let Some(fr) = dof_to_free[gdof] {
             rhs_free[fr] += f_ext_global[gdof];
@@ -439,6 +574,22 @@ pub fn solve_linear_static_with_config(
         let f_elem = ce.k_global * u_elem;
         for a in 0..12 {
             ku_global[elem_gdofs[a]] += f_elem[a];
+        }
+    }
+    for cs in &cached_shells {
+        let ndof = cs.node_indices.len() * 6;
+        let mut shell_gdofs = Vec::with_capacity(ndof);
+        let mut u_shell = DVector::<f64>::zeros(ndof);
+        for (k, &n_idx) in cs.node_indices.iter().enumerate() {
+            for d in 0..6 {
+                let gdof = n_idx * 6 + d;
+                shell_gdofs.push(gdof);
+                u_shell[k * 6 + d] = u_global[gdof];
+            }
+        }
+        let f_shell = &cs.k_global * u_shell;
+        for a in 0..ndof {
+            ku_global[shell_gdofs[a]] += f_shell[a];
         }
     }
 
@@ -575,11 +726,44 @@ pub fn solve_linear_static_with_config(
         );
     }
 
+    let mut shell_results = HashMap::with_capacity(cached_shells.len());
+    for cs in &cached_shells {
+        let ndof = cs.node_indices.len() * 6;
+        let mut u_shell_global = DVector::<f64>::zeros(ndof);
+        for (k, &n_idx) in cs.node_indices.iter().enumerate() {
+            for d in 0..6 {
+                u_shell_global[k * 6 + d] = u_global[n_idx * 6 + d];
+            }
+        }
+        let u_shell_local = &cs.t_mat * u_shell_global;
+        let res = recover_shell_result(
+            cs.id,
+            &cs.frame,
+            cs.e,
+            cs.g,
+            cs.nu,
+            cs.fy,
+            cs.thickness,
+            &u_shell_local,
+        )
+        .map_err(|reason| SolverError::InvalidElement {
+            element_id: cs.id,
+            reason,
+        })?;
+
+        max_stress_pa = max_stress_pa.max(res.max_von_mises_pa);
+        if res.utilization >= max_utilization {
+            max_utilization = res.utilization;
+        }
+        shell_results.insert(cs.id, res);
+    }
+
     let solve_time_ms = t_start.elapsed().as_secs_f64() * 1000.0;
 
     Ok(Solution {
         node_results,
         element_results,
+        shell_results,
         summary: AnalysisSummary {
             solve_time_ms,
             total_dofs,
