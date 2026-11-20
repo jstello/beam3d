@@ -47,6 +47,10 @@ cargo run --release -p beam3d-ui
 | **Undo / Redo** | `Cmd+Z` / `Cmd+Shift+Z` |
 | **End Beam Chain / Cancel** | `Esc` or Right-click |
 
+## Feedback & Issues
+
+Have a bug report, verification discrepancy, or feature/benchmark idea? Please open a [GitHub Issue](https://github.com/jstello/beam3d/issues) — issues are the main place for feedback and roadmap ideas.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
